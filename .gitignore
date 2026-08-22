@@ -1,0 +1,7 @@
+node_modules/
+.env
+dist/
+*.db
+.DS_Store
+certs/
+*.pem

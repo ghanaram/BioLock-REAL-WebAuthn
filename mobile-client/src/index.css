@@ -1,0 +1,5 @@
+@import "tailwindcss";
+:root{font-family:Inter,ui-sans-serif,system-ui,sans-serif;background:#050816;color:#e6f7ff}
+*{box-sizing:border-box} body{margin:0;min-width:320px;background:radial-gradient(circle at 20% 0%,#0b1e3a 0,#050816 42%,#03050d 100%);min-height:100vh}
+.glass{background:rgba(10,20,40,.68);border:1px solid rgba(87,214,255,.16);box-shadow:0 20px 70px rgba(0,0,0,.3);backdrop-filter:blur(18px)}
+.glow{box-shadow:0 0 40px rgba(34,211,238,.12)} button{transition:.2s} button:active{transform:scale(.98)}
