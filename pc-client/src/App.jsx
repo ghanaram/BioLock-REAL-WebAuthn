@@ -12,12 +12,40 @@ export default function App(){
  const [seconds,setSeconds]=useState(0)
  const load=async()=>{try{setEvents(await (await fetch(`${API}/api/security-events`)).json());setDevices(await (await fetch(`${API}/api/devices`)).json())}catch{}}
  const newRequest=async()=>{try{const r=await fetch(`${API}/api/auth/request`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pcDeviceId:pcId})});const d=await r.json();setRequest(d);setStatus('Waiting for phone authorization...');window.history.replaceState({},'',`?request=${d.requestId}`);setLocked(true);setSeconds(60)}catch{setStatus('Server unavailable')}}
- useEffect(()=>{load();socket.on('connect',()=>setConnected(true));socket.on('disconnect',()=>setConnected(false))
- socket.on('pc:access-granted',d=>{setLocked(false);setStatus('BIOLOCK UNLOCKED');setSession({device:d.deviceId,time:new Date()});setPage('lock');load()})
- socket.on('pc:access-denied',()=>{setLocked(true);setStatus('ACCESS DENIED');load()})
- socket.on('demo:reset',()=>{setLocked(true);setRequest(null);setSession(null);setStatus('Waiting for authorization...');setPage('lock')})
- socket.on('security:event',()=>load())
- return()=>socket.removeAllListeners()},[])
+//  useEffect(()=>{load();socket.on('connect',()=>setConnected(true));socket.on('disconnect',()=>setConnected(false))
+//  socket.on('pc:access-granted',d=>{setLocked(false);setStatus('BIOLOCK UNLOCKED');setSession({device:d.deviceId,time:new Date()});setPage('lock');load()})
+//  socket.on('pc:access-denied',()=>{setLocked(true);setStatus('ACCESS DENIED');load()})
+//  socket.on('demo:reset',()=>{setLocked(true);setRequest(null);setSession(null);setStatus('Waiting for authorization...');setPage('lock')})
+//  socket.on('security:event',()=>load())
+//  return()=>socket.removeAllListeners()},[])
+useEffect(() => {
+  load();
+
+  socket.on("connect", () => {
+    console.log("🟢 PC CLIENT SOCKET CONNECTED:", socket.id);
+    setConnected(true);
+  });
+
+  socket.on("disconnect", (reason) => {
+    console.log("🔴 PC CLIENT SOCKET DISCONNECTED:", reason);
+    setConnected(false);
+  });
+
+  socket.on("pc:access-granted", (d) => {
+    console.log("🔥 PC CLIENT ACCESS GRANTED:", d);
+
+    setLocked(false);
+    setStatus("BIOLOCK UNLOCKED");
+    setSession({
+      device: d.deviceId,
+      time: new Date()
+    });
+    setPage("lock");
+    load();
+  });
+
+  return () => socket.removeAllListeners();
+}, []);
  useEffect(()=>{if(!request||seconds<=0)return;const x=setInterval(()=>setSeconds(s=>s-1),1000);return()=>clearInterval(x)},[request,seconds])
  useEffect(()=>{if(seconds===0&&request)setStatus('QR CODE EXPIRED')},[seconds])
  const simulate=async()=>{socket.emit('security:event',{type:'UNAUTHORIZED',severity:'CRITICAL',deviceId:pcId,message:'Multiple unauthorized access attempts detected.'});setStatus('UNAUTHORIZED ACCESS ATTEMPT');await load()}

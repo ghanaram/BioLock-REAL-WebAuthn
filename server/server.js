@@ -41,7 +41,7 @@ cert: fs.readFileSync(
 const PORT = Number(process.env.PORT || 5000);
 const RP_NAME = process.env.RP_NAME || "BioLock";
 const RP_ID = process.env.RP_ID || "localhost";
-const ORIGIN = process.env.ORIGIN || "https://nut-anthropology-critical-kurt.trycloudflare.com";
+const ORIGIN = process.env.ORIGIN || "https://findings-depending-takes-jelsoft.trycloudflare.com";
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || ORIGIN;
 const MOBILE_PATH = process.env.MOBILE_PATH || "/mobile/";
 
@@ -57,6 +57,8 @@ app.use(rateLimit({ windowMs: 60_000, limit: 120, standardHeaders: true }));
 const io = new Server(server, {
   cors: { origin: true, methods: ["GET", "POST", "DELETE"] }
 });
+
+const pcAgentSockets = new Map();
 
 const nowIso = () => new Date().toISOString();
 const addSecurityEvent = (type, severity, deviceId, message) => {
@@ -673,15 +675,73 @@ app.post("/api/webauthn/auth/verify", async (req, res) => {
     // 12. Tell PC to unlock
     // --------------------------------------------------
 
-    io.emit(
+    const targetPcId = String(
+  authRequest.pc_device_id || ""
+);
+
+const targetSocketId =
+  pcAgentSockets.get(targetPcId);
+
+const accessPayload = {
+  requestId,
+  deviceId,
+  method: "WEBAUTHN_PASSKEY",
+  timestamp: nowIso(),
+  pcDeviceId: targetPcId,
+};
+
+if (targetSocketId) {
+
+  const targetSocket =
+    io.sockets.sockets.get(targetSocketId);
+
+  if (targetSocket) {
+
+    targetSocket.emit(
       "pc:access-granted",
-      {
-        requestId,
-        deviceId,
-        method: "WEBAUTHN_PASSKEY",
-        timestamp: nowIso(),
-      }
+      accessPayload
     );
+
+    console.log("");
+    console.log("======================================");
+    console.log("✅ TARGETED PC ACCESS GRANTED");
+    console.log("======================================");
+    console.log("PC ID   :", targetPcId);
+    console.log("Socket  :", targetSocketId);
+    console.log("Request :", requestId);
+    console.log("Phone   :", deviceId);
+    console.log("Method  :", "WEBAUTHN_PASSKEY");
+    console.log("======================================");
+
+  } else {
+
+    console.log(
+      "⚠️ PC socket no longer available:",
+      targetPcId
+    );
+
+    addSecurityEvent(
+      "PC_OFFLINE",
+      "WARNING",
+      targetPcId,
+      "PC Agent was not connected when authorization was completed."
+    );
+  }
+
+} else {
+
+  console.log(
+    "⚠️ No registered PC Agent found:",
+    targetPcId
+  );
+
+  addSecurityEvent(
+    "PC_OFFLINE",
+    "WARNING",
+    targetPcId,
+    "No active PC Agent found for authorized request."
+  );
+}
 
     console.log(
       "======================================"
@@ -941,13 +1001,141 @@ app.post("/api/demo/reset", (_,res) => {
   res.json({ok:true});
 });
 
-io.on("connection",(socket) => {
-  socket.emit("server:welcome",{socketId:socket.id});
-  socket.on("phone:join-request",(data) => io.emit("phone:join-request",data));
-  socket.on("security:event",(data) => addSecurityEvent(
-    data.type || "UNAUTHORIZED", data.severity || "WARNING",
-    data.deviceId, data.message || "Security event"
-  ));
+
+io.on("connection", (socket) => {
+
+  socket.emit("server:welcome", {
+    socketId: socket.id
+  });
+
+  socket.on("phone:join-request", (data) => {
+    io.emit("phone:join-request", data);
+  });
+
+  socket.on("security:event", (data) =>
+    addSecurityEvent(
+      data.type || "UNAUTHORIZED",
+      data.severity || "WARNING",
+      data.deviceId,
+      data.message || "Security event"
+    )
+  );
+
+  /*
+  |--------------------------------------------------------------------------
+  | PC AGENT REGISTRATION
+  |--------------------------------------------------------------------------
+  */
+
+  socket.on("pc:agent-register", (data) => {
+
+    const pcDeviceId = String(
+      data?.pcDeviceId || ""
+    );
+
+    if (!pcDeviceId) {
+      console.log("❌ PC Agent registration rejected: missing PC ID");
+      return;
+    }
+
+    ensureDevice(
+      pcDeviceId,
+      "pc",
+      data.hostname || pcDeviceId
+    );
+
+    /*
+     * If the same PC reconnects,
+     * replace its old socket with the new socket.
+     */
+
+    const oldSocketId =
+      pcAgentSockets.get(pcDeviceId);
+
+    if (oldSocketId && oldSocketId !== socket.id) {
+      console.log(
+        "🔄 Replacing old PC Agent socket:",
+        pcDeviceId,
+        oldSocketId
+      );
+    }
+
+    pcAgentSockets.set(
+      pcDeviceId,
+      socket.id
+    );
+
+    /*
+     * Keep PC ID attached to this socket.
+     */
+
+    socket.pcDeviceId = pcDeviceId;
+
+    console.log("");
+    console.log("=================================");
+    console.log("🖥️ PC AGENT CONNECTED");
+    console.log("=================================");
+    console.log("PC ID   :", pcDeviceId);
+    console.log("Socket  :", socket.id);
+    console.log("Host    :", data.hostname || "Unknown");
+    console.log("Platform:", data.platform || "Unknown");
+    console.log("=================================");
+
+    socket.emit("pc:agent-registered", {
+      ok: true,
+      pcDeviceId,
+      timestamp: nowIso()
+    });
+  });
+
+  /*
+  |--------------------------------------------------------------------------
+  | PC HEARTBEAT
+  |--------------------------------------------------------------------------
+  */
+
+  socket.on("pc:heartbeat", (data) => {
+
+    const pcDeviceId = String(
+      data?.pcDeviceId || socket.pcDeviceId || ""
+    );
+
+    if (!pcDeviceId) {
+      return;
+    }
+
+    ensureDevice(
+      pcDeviceId,
+      "pc",
+      data?.hostname || pcDeviceId
+    );
+  });
+
+  /*
+  |--------------------------------------------------------------------------
+  | SOCKET DISCONNECT
+  |--------------------------------------------------------------------------
+  */
+
+  socket.on("disconnect", (reason) => {
+
+    const pcDeviceId = socket.pcDeviceId;
+
+    if (
+      pcDeviceId &&
+      pcAgentSockets.get(pcDeviceId) === socket.id
+    ) {
+
+      pcAgentSockets.delete(pcDeviceId);
+
+      console.log(
+        "🖥️ PC AGENT OFFLINE:",
+        pcDeviceId,
+        "| Reason:",
+        reason
+      );
+    }
+  });
 });
 
 app.delete("/api/webauthn/passkey/reset", (req, res) => {
@@ -982,10 +1170,8 @@ app.delete("/api/webauthn/passkey/reset", (req, res) => {
   }
 });
 
-
-
 server.listen(PORT,"0.0.0.0",() => {
-  console.log(`BioLock server running on https://nut-anthropology-critical-kurt.trycloudflare.com:${PORT}`);
+  console.log(`BioLock server running on https://findings-depending-takes-jelsoft.trycloudflare.com:${PORT}`);
   console.log("QR BASE URL:", PUBLIC_BASE_URL);
   console.log("MOBILE PATH:", MOBILE_PATH);
 });
