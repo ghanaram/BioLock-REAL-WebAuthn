@@ -625,6 +625,12 @@ app.post("/api/webauthn/auth/verify", async (req, res) => {
         error: "WebAuthn verification failed",
       });
     }
+    addSecurityEvent(
+  "PASSKEY_VERIFIED",
+  "INFO",
+  deviceId,
+  "WebAuthn passkey verified successfully."
+);
 
     // --------------------------------------------------
     // 8. Consume challenge
@@ -872,6 +878,12 @@ if (targetSocketId) {
   expiresAt: new Date(sessionExpiresAt).toISOString(),
   status: "online"
 });
+addSecurityEvent(
+  "ACCESS_GRANTED",
+  "INFO",
+  deviceId,
+  `PC ${targetPcId} authorized successfully using WebAuthn passkey.`
+);
     console.log("");
     console.log("======================================");
     console.log("✅ TARGETED PC ACCESS GRANTED");
@@ -1025,7 +1037,12 @@ app.post("/api/auth/request", async (req, res) => {
     expiresAt,
     nowIso()
   );
-
+  addSecurityEvent(
+  "AUTH_REQUEST_CREATED",
+  "INFO",
+  pcDeviceId,
+  `PC ${pcDeviceId} requested smartphone authorization.`
+);
   // URL stored inside QR
   const qrPayload =
     `${PUBLIC_BASE_URL}${MOBILE_PATH}?request=${encodeURIComponent(requestId)}`;
@@ -1437,6 +1454,7 @@ io.on("connection", (socket) => {
       data?.message || "Security event"
     );
   });
+  
 
   /*
   |--------------------------------------------------------------------------

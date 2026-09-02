@@ -325,14 +325,43 @@ function lockWindows() {
       "BioLock Interactive Lock"
     ],
     (error, stdout, stderr) => {
+
       if (error) {
-        console.error("❌ BioLock Windows lock failed:", error.message);
-        console.error("STDERR:", stderr);
+        console.error(
+          "❌ BioLock Windows lock failed:",
+          error.message
+        );
+
+        console.error(
+          "STDERR:",
+          stderr
+        );
+
+        // Report lock failure to server
+        socket.emit("security:event", {
+          type: "WINDOWS_LOCK_FAILED",
+          severity: "ERROR",
+          deviceId: PC_ID,
+          message:
+            `Windows lock command failed for PC ${PC_ID}.`
+          });
+
         return;
       }
 
       console.log("🔒 WINDOWS LOCK TASK TRIGGERED");
-      console.log("Interactive Windows lock requested successfully.");
+      console.log(
+        "Interactive Windows lock requested successfully."
+      );
+
+      // Report successful Windows lock trigger
+      socket.emit("security:event", {
+        type: "WINDOWS_LOCK_TRIGGERED",
+        severity: "INFO",
+        deviceId: PC_ID,
+        message:
+          `Windows lock task triggered successfully for PC ${PC_ID}.`
+              });
     }
   );
 }

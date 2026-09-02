@@ -88,4 +88,68 @@ CREATE TABLE IF NOT EXISTS pc_devices (
 
 `);
 
+// ===============================
+// BIOLOCK AUDIT LOG
+// ===============================
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS audit_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_type TEXT NOT NULL,
+    pc_device_id TEXT,
+    device_id TEXT,
+    result TEXT,
+    message TEXT,
+    metadata TEXT,
+    created_at TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at
+  ON audit_logs(created_at);
+
+  CREATE INDEX IF NOT EXISTS idx_audit_logs_pc_device
+  ON audit_logs(pc_device_id);
+
+  CREATE INDEX IF NOT EXISTS idx_audit_logs_device
+  ON audit_logs(device_id);
+`);
+
+function createAuditLog({
+  eventType,
+  pcDeviceId = null,
+  deviceId = null,
+  result = "SUCCESS",
+  message = null,
+  metadata = null,
+}) {
+  const createdAt = new Date().toISOString();
+
+  db.prepare(`
+    INSERT INTO audit_logs (
+      event_type,
+      pc_device_id,
+      device_id,
+      result,
+      message,
+      metadata,
+      created_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    eventType,
+    pcDeviceId,
+    deviceId,
+    result,
+    message,
+    metadata
+      ? JSON.stringify(metadata)
+      : null,
+    createdAt
+  );
+
+  return createdAt;
+}
+
+
 module.exports = db;
+module.exports.createAuditLog = createAuditLog;
