@@ -41,10 +41,11 @@ cert: fs.readFileSync(
 const PORT = Number(process.env.PORT || 5000);
 const RP_NAME = process.env.RP_NAME || "BioLock";
 const RP_ID = process.env.RP_ID || "localhost";
-const ORIGIN = process.env.ORIGIN || "https://findings-depending-takes-jelsoft.trycloudflare.com";
+const ORIGIN = process.env.ORIGIN || "https://captain-percentage-lone-surgeons.trycloudflare.com";
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || ORIGIN;
 const MOBILE_PATH = process.env.MOBILE_PATH || "/mobile/";
-
+const AUTH_SESSION_MS = Number(process.env.AUTH_SESSION_MINUTES || 30) * 60 * 1000;
+  
 console.log("ENV PUBLIC_BASE_URL =", process.env.PUBLIC_BASE_URL);
 console.log("ENV MOBILE_PATH =", process.env.MOBILE_PATH);
 
@@ -61,12 +62,39 @@ const io = new Server(server, {
 const pcAgentSockets = new Map();
 
 const nowIso = () => new Date().toISOString();
-const addSecurityEvent = (type, severity, deviceId, message) => {
-  db.prepare(`INSERT INTO security_events
-    (event_type,severity,device_id,message,created_at) VALUES (?,?,?,?,?)`)
-    .run(type, severity, deviceId || null, message, nowIso());
-  io.emit("security:event", { type, severity, deviceId, message, createdAt: nowIso() });
-};
+
+function addSecurityEvent(type, severity, deviceId, message) {
+
+  const createdAt = nowIso();
+
+  const result = db.prepare(`
+    INSERT INTO security_events
+    (event_type, severity, device_id, message, created_at)
+    VALUES (?,?,?,?,?)
+  `).run(
+    type,
+    severity,
+    deviceId || null,
+    message,
+    createdAt
+  );
+
+  const event = {
+    id: Number(result.lastInsertRowid),
+    event_type: type,
+    severity,
+    device_id: deviceId || null,
+    message,
+    created_at: createdAt
+  };
+
+  // 🔴 REAL-TIME SECURITY EVENT
+if (typeof io !== "undefined") {
+  io.emit("security:event-created", event);
+}
+
+  console.log("📡 LIVE SECURITY EVENT:", event);
+}
 
 const ensureDevice = (deviceId, type, name) => {
   const existing = db.prepare("SELECT * FROM devices WHERE device_id=?").get(deviceId);
@@ -643,6 +671,74 @@ app.post("/api/webauthn/auth/verify", async (req, res) => {
     );
 
     // --------------------------------------------------
+// 10A. Update PC authorization state
+// --------------------------------------------------
+
+const targetPcId = String(
+  authRequest.pc_device_id || ""
+);
+
+if (!targetPcId) {
+  return res.status(400).json({
+    verified: false,
+    error: "Authentication request has no PC device ID",
+  });
+}
+
+const authorizationTime = nowIso();
+
+const sessionExpiresAt =
+  Date.now() + AUTH_SESSION_MS;
+
+const expiresAt =
+  new Date(sessionExpiresAt).toISOString();
+
+db.prepare(`
+  UPDATE pc_devices
+  SET
+    authorized = 1,
+    authorized_device = ?,
+    authorized_at = ?,
+    status = 'online',
+    last_seen = ?,
+    updated_at = ?
+  WHERE pc_device_id = ?
+`).run(
+  deviceId,
+  authorizationTime,
+  authorizationTime,
+  authorizationTime,
+  targetPcId
+);
+
+console.log("======================================");
+console.log("🔓 PC AUTHORIZATION STATE UPDATED");
+console.log("======================================");
+console.log("PC ID   :", targetPcId);
+console.log("Device  :", deviceId);
+console.log("State   : AUTHORIZED");
+console.log("Time    :", authorizationTime);
+console.log("Expires :", expiresAt);
+console.log(
+  "Duration:",
+  AUTH_SESSION_MS / 60000,
+  "minutes"
+);
+console.log("======================================");
+
+// --------------------------------------------------
+// LIVE DASHBOARD STATE UPDATE
+// --------------------------------------------------
+
+io.emit("pc:status-updated", {
+  pcDeviceId: targetPcId,
+  authorized: true,
+  authorizedDevice: deviceId,
+  authorizedAt: authorizationTime,
+  expiresAt: new Date(sessionExpiresAt).toISOString(),
+  status: "online",
+});
+    // --------------------------------------------------
     // 11. Authentication event
     // --------------------------------------------------
 
@@ -671,13 +767,64 @@ app.post("/api/webauthn/auth/verify", async (req, res) => {
       "Real WebAuthn authentication successful."
     );
 
+   
+    // --------------------------------------------------
+    // 11.5. UPDATE PC AUTHORIZATION STATE
+    // --------------------------------------------------
+
+
+    if (targetPcId) {
+      db.prepare(`
+        INSERT INTO pc_devices (
+          pc_device_id,
+          hostname,
+          platform,
+          status,
+          authorized,
+          authorized_device,
+          authorized_at,
+          last_seen,
+          created_at,
+          updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(pc_device_id)
+        DO UPDATE SET
+          status = excluded.status,
+          authorized = excluded.authorized,
+          authorized_device = excluded.authorized_device,
+          authorized_at = excluded.authorized_at,
+          last_seen = excluded.last_seen,
+          updated_at = excluded.updated_at
+      `).run(
+        targetPcId,
+        null,
+        null,
+        "online",
+        1,
+        deviceId,
+        nowIso(),
+        nowIso(),
+        nowIso(),
+        nowIso()
+      );
+
+      console.log("");
+      console.log("======================================");
+      console.log("🟢 PC AUTHORIZATION STATE UPDATED");
+      console.log("======================================");
+      console.log("PC ID   :", targetPcId);
+      console.log("Device  :", deviceId);
+      console.log("Status  : AUTHORIZED");
+      console.log("======================================");
+    }
+
+
+
+
     // --------------------------------------------------
     // 12. Tell PC to unlock
     // --------------------------------------------------
-
-    const targetPcId = String(
-  authRequest.pc_device_id || ""
-);
 
 const targetSocketId =
   pcAgentSockets.get(targetPcId);
@@ -686,8 +833,9 @@ const accessPayload = {
   requestId,
   deviceId,
   method: "WEBAUTHN_PASSKEY",
-  timestamp: nowIso(),
+  timestamp: authorizationTime,
   pcDeviceId: targetPcId,
+  expiresAt: new Date(sessionExpiresAt).toISOString(),
 };
 
 if (targetSocketId) {
@@ -701,7 +849,29 @@ if (targetSocketId) {
       "pc:access-granted",
       accessPayload
     );
-
+    db.prepare(`
+  UPDATE pc_devices
+  SET
+    authorized=1,
+    authorized_device=?,
+    authorized_at=?,
+    status='online',
+    updated_at=?
+  WHERE pc_device_id=?
+`).run(
+  deviceId,
+  nowIso(),
+  nowIso(),
+  targetPcId
+);
+  io.emit("pc:status-updated", {
+  pcDeviceId: targetPcId,
+  authorized: true,
+  authorizedDevice: deviceId,
+  authorizedAt: authorizationTime,
+  expiresAt: new Date(sessionExpiresAt).toISOString(),
+  status: "online"
+});
     console.log("");
     console.log("======================================");
     console.log("✅ TARGETED PC ACCESS GRANTED");
@@ -947,6 +1117,89 @@ app.post("/api/auth/deny", (req,res) => {
   res.json({ok:true});
 });
 
+app.post("/api/auth/lock", (req, res) => {
+  try {
+    const pcDeviceId = String(
+      req.body.pcDeviceId || "BIOLOCK-PC-01"
+    );
+
+    const targetSocketId = pcAgentSockets.get(pcDeviceId);
+// Persistent PC authorization state
+db.prepare(`
+  UPDATE pc_devices
+  SET
+    status='locked',
+    authorized=0,
+    authorized_device=NULL,
+    authorized_at=NULL,
+    updated_at=?
+  WHERE pc_device_id=?
+`).run(
+  nowIso(),
+  pcDeviceId
+);
+    // Tell the actual PC Agent to clear authorization
+    if (targetSocketId) {
+      const targetSocket = io.sockets.sockets.get(targetSocketId);
+
+      if (targetSocket) {
+        targetSocket.emit("pc:access-revoked", {
+          pcDeviceId,
+          reason: "User manually locked BioLock",
+          timestamp: nowIso()
+        });
+      }
+    }
+    db.prepare(`
+  UPDATE pc_devices
+  SET
+    authorized=0,
+    authorized_device=NULL,
+    authorized_at=NULL,
+    updated_at=?
+  WHERE pc_device_id=?
+`).run(
+  nowIso(),
+  pcDeviceId
+);
+io.emit("pc:status-updated", {
+  pcDeviceId,
+  authorized: false,
+  authorizedDevice: null,
+  authorizedAt: null,
+  status: "online"
+});
+    addSecurityEvent(
+      "LOCKED",
+      "INFO",
+      pcDeviceId,
+      "BioLock PC was manually locked by the user."
+    );
+
+    console.log("");
+    console.log("=================================");
+    console.log("🔒 BIOLOCK PC LOCKED");
+    console.log("=================================");
+    console.log("PC ID:", pcDeviceId);
+    console.log("Agent Socket:", targetSocketId || "NOT FOUND");
+    console.log("=================================");
+
+    res.json({
+      ok: true,
+      locked: true,
+      pcDeviceId
+    });
+
+  } catch (e) {
+    console.error("❌ Lock error:", e);
+
+    res.status(500).json({
+      ok: false,
+      error: e.message
+    });
+  }
+});
+
 app.post("/api/devices/pair", (req,res) => {
   const phoneDeviceId = String(req.body.phoneDeviceId || "GHANARAM-PHONE");
   ensureDevice(phoneDeviceId,"phone","Ghanaram's Phone");
@@ -965,6 +1218,159 @@ app.get("/api/devices", (_,res) => {
     ORDER BY d.created_at DESC`).all();
   res.json(devices);
 });
+
+app.get("/api/pcs", (req, res) => {
+  try {
+    const pcs = db.prepare(`
+      SELECT
+        pc_device_id,
+        hostname,
+        platform,
+        status,
+        authorized,
+        authorized_device,
+        authorized_at,
+        last_seen,
+        created_at,
+        updated_at
+      FROM pc_devices
+      ORDER BY created_at DESC
+    `).all();
+
+    res.json(pcs);
+
+  } catch (e) {
+    console.error("❌ PC list error:", e);
+
+    res.status(500).json({
+      ok: false,
+      error: e.message
+    });
+  }
+});
+
+// ==========================================
+// MANUAL PC LOCK
+// ==========================================
+
+app.post("/api/pcs/:pcDeviceId/lock", (req, res) => {
+  try {
+    const pcDeviceId = String(req.params.pcDeviceId || "");
+
+    if (!pcDeviceId) {
+      return res.status(400).json({
+        ok: false,
+        error: "Missing PC device ID",
+      });
+    }
+
+    const pc = db.prepare(`
+      SELECT *
+      FROM pc_devices
+      WHERE pc_device_id=?
+    `).get(pcDeviceId);
+
+    if (!pc) {
+      return res.status(404).json({
+        ok: false,
+        error: "PC not found",
+      });
+    }
+
+    // 1. Update DB first
+    db.prepare(`
+      UPDATE pc_devices
+      SET
+        authorized=0,
+        authorized_device=NULL,
+        authorized_at=NULL,
+        updated_at=?
+      WHERE pc_device_id=?
+    `).run(
+      nowIso(),
+      pcDeviceId
+    );
+
+    // 2. Find connected PC Agent
+    const targetSocketId =
+      pcAgentSockets.get(pcDeviceId);
+
+    if (targetSocketId) {
+
+      const targetSocket =
+        io.sockets.sockets.get(targetSocketId);
+
+      if (targetSocket) {
+
+        // 3. Tell PC Agent to lock
+        targetSocket.emit("pc:access-revoked", {
+          pcDeviceId,
+          reason: "Manual lock from BioLock Dashboard",
+          timestamp: nowIso(),
+        });
+
+        console.log("");
+        console.log("======================================");
+        console.log("🔒 BIOLOCK MANUAL LOCK");
+        console.log("======================================");
+        console.log("PC ID :", pcDeviceId);
+        console.log("Socket:", targetSocketId);
+        console.log("Action: LOCK");
+        console.log("======================================");
+
+      } else {
+        console.log(
+          "⚠️ PC socket unavailable:",
+          pcDeviceId
+        );
+      }
+
+    } else {
+      console.log(
+        "⚠️ No active PC Agent:",
+        pcDeviceId
+      );
+    }
+
+    // 4. Security event
+    addSecurityEvent(
+      "MANUAL_LOCK",
+      "INFO",
+      pcDeviceId,
+      "PC manually locked from BioLock Dashboard."
+    );
+
+    // 5. Update Dashboard immediately
+    io.emit("pc:status-updated", {
+      pcDeviceId,
+      authorized: false,
+      authorizedDevice: null,
+      authorizedAt: null,
+      status: "online",
+    });
+
+    return res.json({
+      ok: true,
+      locked: true,
+      pcDeviceId,
+      message: "PC lock command sent",
+    });
+
+  } catch (e) {
+
+    console.error(
+      "❌ Manual PC lock error:",
+      e
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error: e.message,
+    });
+  }
+});
+
+
 
 app.delete("/api/devices/:id", (req,res) => {
   const id = String(req.params.id);
@@ -1001,25 +1407,36 @@ app.post("/api/demo/reset", (_,res) => {
   res.json({ok:true});
 });
 
-
 io.on("connection", (socket) => {
 
   socket.emit("server:welcome", {
     socketId: socket.id
   });
 
+  /*
+  |--------------------------------------------------------------------------
+  | PHONE REQUEST
+  |--------------------------------------------------------------------------
+  */
+
   socket.on("phone:join-request", (data) => {
     io.emit("phone:join-request", data);
   });
 
-  socket.on("security:event", (data) =>
+  /*
+  |--------------------------------------------------------------------------
+  | SECURITY EVENT
+  |--------------------------------------------------------------------------
+  */
+
+  socket.on("security:event", (data) => {
     addSecurityEvent(
-      data.type || "UNAUTHORIZED",
-      data.severity || "WARNING",
-      data.deviceId,
-      data.message || "Security event"
-    )
-  );
+      data?.type || "UNAUTHORIZED",
+      data?.severity || "WARNING",
+      data?.deviceId,
+      data?.message || "Security event"
+    );
+  });
 
   /*
   |--------------------------------------------------------------------------
@@ -1034,42 +1451,147 @@ io.on("connection", (socket) => {
     );
 
     if (!pcDeviceId) {
-      console.log("❌ PC Agent registration rejected: missing PC ID");
+      console.log(
+        "❌ PC Agent registration rejected: missing PC ID"
+      );
       return;
     }
+
+    const hostname = String(
+      data?.hostname || pcDeviceId
+    );
+
+    const platform = String(
+      data?.platform || "unknown"
+    );
+
+    /*
+    |--------------------------------------------------------------------------
+    | Main devices table
+    |--------------------------------------------------------------------------
+    */
 
     ensureDevice(
       pcDeviceId,
       "pc",
-      data.hostname || pcDeviceId
+      hostname
     );
 
     /*
-     * If the same PC reconnects,
-     * replace its old socket with the new socket.
-     */
+    |--------------------------------------------------------------------------
+    | PC DEVICE RECORD
+    |--------------------------------------------------------------------------
+    */
+
+    const existingPc = db.prepare(`
+      SELECT *
+      FROM pc_devices
+      WHERE pc_device_id=?
+    `).get(pcDeviceId);
+
+    if (!existingPc) {
+
+      db.prepare(`
+        INSERT INTO pc_devices
+        (
+          pc_device_id,
+          hostname,
+          platform,
+          status,
+          authorized,
+          authorized_device,
+          authorized_at,
+          last_seen,
+          created_at,
+          updated_at
+        )
+        VALUES (?,?,?,?,?,?,?,?,?,?)
+      `).run(
+        pcDeviceId,
+        hostname,
+        platform,
+        "online",
+        0,
+        null,
+        null,
+        nowIso(),
+        nowIso(),
+        nowIso()
+      );
+
+    } else {
+
+      /*
+       * IMPORTANT:
+       * Reconnecting PC should NOT automatically
+       * become authorized.
+       */
+
+      db.prepare(`
+        UPDATE pc_devices
+        SET
+          hostname=?,
+          platform=?,
+          status='online',
+          last_seen=?,
+          updated_at=?
+        WHERE pc_device_id=?
+      `).run(
+        hostname,
+        platform,
+        nowIso(),
+        nowIso(),
+        pcDeviceId
+      );
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | SOCKET REPLACEMENT
+    |--------------------------------------------------------------------------
+    */
 
     const oldSocketId =
       pcAgentSockets.get(pcDeviceId);
 
-    if (oldSocketId && oldSocketId !== socket.id) {
+    if (
+      oldSocketId &&
+      oldSocketId !== socket.id
+    ) {
+
       console.log(
         "🔄 Replacing old PC Agent socket:",
         pcDeviceId,
         oldSocketId
       );
+
+      const oldSocket =
+        io.sockets.sockets.get(oldSocketId);
+
+      if (oldSocket) {
+        oldSocket.disconnect(true);
+      }
     }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Store active socket
+    |--------------------------------------------------------------------------
+    */
 
     pcAgentSockets.set(
       pcDeviceId,
       socket.id
     );
 
-    /*
-     * Keep PC ID attached to this socket.
-     */
+    socket.pcDeviceId =
+      pcDeviceId;
 
-    socket.pcDeviceId = pcDeviceId;
+    /*
+    |--------------------------------------------------------------------------
+    | LOG
+    |--------------------------------------------------------------------------
+    */
 
     console.log("");
     console.log("=================================");
@@ -1077,17 +1599,80 @@ io.on("connection", (socket) => {
     console.log("=================================");
     console.log("PC ID   :", pcDeviceId);
     console.log("Socket  :", socket.id);
-    console.log("Host    :", data.hostname || "Unknown");
-    console.log("Platform:", data.platform || "Unknown");
+    console.log("Host    :", hostname);
+    console.log("Platform:", platform);
     console.log("=================================");
 
-    socket.emit("pc:agent-registered", {
-      ok: true,
-      pcDeviceId,
-      timestamp: nowIso()
-    });
+    /*
+    |--------------------------------------------------------------------------
+    | Registration response
+    |--------------------------------------------------------------------------
+    */
+
+    socket.emit(
+      "pc:agent-registered",
+      {
+        ok: true,
+        pcDeviceId,
+        timestamp: nowIso()
+      }
+    );
+    console.log("🔎 CHECKING PC STATE FROM DATABASE:", pcDeviceId);
+
+const currentPcState = db.prepare(`
+  SELECT
+    authorized,
+    authorized_device,
+    authorized_at,
+    status
+  FROM pc_devices
+  WHERE pc_device_id=?
+`).get(pcDeviceId);
+
+console.log("🔎 DATABASE PC STATE:", currentPcState);
+
+if (currentPcState) {
+
+  socket.emit("pc:state-sync", {
+    pcDeviceId,
+
+    authorized:
+      Number(currentPcState.authorized) === 1,
+
+    authorizedDevice:
+      currentPcState.authorized_device || null,
+
+    authorizedAt:
+      currentPcState.authorized_at || null,
+
+    status:
+      currentPcState.status || "online",
+
+    timestamp: nowIso()
   });
 
+  console.log("");
+  console.log("=================================");
+  console.log("🔄 BIOLOCK PC STATE SYNC");
+  console.log("=================================");
+  console.log("PC ID :", pcDeviceId);
+  console.log(
+    "Authorized :",
+    Number(currentPcState.authorized) === 1
+  );
+  console.log(
+    "Device :",
+    currentPcState.authorized_device || "None"
+  );
+  console.log(
+    "Status :",
+    currentPcState.status || "online"
+  );
+  console.log("=================================");
+}
+  });
+
+  
   /*
   |--------------------------------------------------------------------------
   | PC HEARTBEAT
@@ -1097,20 +1682,65 @@ io.on("connection", (socket) => {
   socket.on("pc:heartbeat", (data) => {
 
     const pcDeviceId = String(
-      data?.pcDeviceId || socket.pcDeviceId || ""
+      data?.pcDeviceId ||
+      socket.pcDeviceId ||
+      ""
     );
 
     if (!pcDeviceId) {
       return;
     }
 
+    /*
+    |--------------------------------------------------------------------------
+    | Verify socket belongs to this PC
+    |--------------------------------------------------------------------------
+    */
+
+    if (
+      socket.pcDeviceId &&
+      socket.pcDeviceId !== pcDeviceId
+    ) {
+      console.log(
+        "⚠️ Invalid heartbeat PC ID:",
+        pcDeviceId
+      );
+      return;
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Update main device
+    |--------------------------------------------------------------------------
+    */
+
     ensureDevice(
       pcDeviceId,
       "pc",
       data?.hostname || pcDeviceId
     );
+
+    /*
+    |--------------------------------------------------------------------------
+    | Update PC status
+    |--------------------------------------------------------------------------
+    */
+
+    db.prepare(`
+      UPDATE pc_devices
+      SET
+        status='online',
+        last_seen=?,
+        updated_at=?
+      WHERE pc_device_id=?
+    `).run(
+      nowIso(),
+      nowIso(),
+      pcDeviceId
+    );
   });
 
+  
   /*
   |--------------------------------------------------------------------------
   | SOCKET DISCONNECT
@@ -1119,23 +1749,58 @@ io.on("connection", (socket) => {
 
   socket.on("disconnect", (reason) => {
 
-    const pcDeviceId = socket.pcDeviceId;
+    const pcDeviceId =
+      socket.pcDeviceId;
+
+    if (!pcDeviceId) {
+      return;
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Only remove socket if this is
+    | still the active socket
+    |--------------------------------------------------------------------------
+    */
 
     if (
-      pcDeviceId &&
-      pcAgentSockets.get(pcDeviceId) === socket.id
+      pcAgentSockets.get(pcDeviceId) ===
+      socket.id
     ) {
 
-      pcAgentSockets.delete(pcDeviceId);
-
-      console.log(
-        "🖥️ PC AGENT OFFLINE:",
-        pcDeviceId,
-        "| Reason:",
-        reason
+      pcAgentSockets.delete(
+        pcDeviceId
       );
+
+      /*
+      |--------------------------------------------------------------------------
+      | Mark PC offline
+      |--------------------------------------------------------------------------
+      */
+
+      db.prepare(`
+        UPDATE pc_devices
+        SET
+          status='offline',
+          last_seen=?,
+          updated_at=?
+        WHERE pc_device_id=?
+      `).run(
+        nowIso(),
+        nowIso(),
+        pcDeviceId
+      );
+
+      console.log("");
+      console.log("=================================");
+      console.log("🖥️ PC AGENT OFFLINE");
+      console.log("=================================");
+      console.log("PC ID :", pcDeviceId);
+      console.log("Reason:", reason);
+      console.log("=================================");
     }
   });
+
 });
 
 app.delete("/api/webauthn/passkey/reset", (req, res) => {
@@ -1170,8 +1835,104 @@ app.delete("/api/webauthn/passkey/reset", (req, res) => {
   }
 });
 
+// --------------------------------------------------
+// 🔐 AUTHORIZATION SESSION MONITOR
+// --------------------------------------------------
+
+setInterval(() => {
+
+  const expiredPcs = db.prepare(`
+    SELECT
+      pc_device_id,
+      authorized_device,
+      authorized_at
+    FROM pc_devices
+    WHERE authorized=1
+      AND authorized_at IS NOT NULL
+  `).all();
+
+  for (const pc of expiredPcs) {
+
+    const authorizedAt =
+      new Date(pc.authorized_at).getTime();
+
+    if (
+      !authorizedAt ||
+      Date.now() - authorizedAt < AUTH_SESSION_MS
+    ) {
+      continue;
+    }
+
+    const targetPcId = pc.pc_device_id;
+
+    console.log("");
+    console.log("======================================");
+    console.log("⏰ BIOLOCK SESSION EXPIRED");
+    console.log("======================================");
+    console.log("PC ID  :", targetPcId);
+    console.log("Device :", pc.authorized_device || "Unknown");
+    console.log("Action : LOCKING PC");
+    console.log("======================================");
+
+    // Update database FIRST
+    db.prepare(`
+      UPDATE pc_devices
+      SET
+        authorized=0,
+        authorized_device=NULL,
+        authorized_at=NULL,
+        updated_at=?
+      WHERE pc_device_id=?
+    `).run(
+      nowIso(),
+      targetPcId
+    );
+
+    // Tell connected PC Agent to lock
+    const targetSocketId =
+      pcAgentSockets.get(targetPcId);
+
+    if (targetSocketId) {
+
+      const targetSocket =
+        io.sockets.sockets.get(targetSocketId);
+
+      if (targetSocket) {
+
+        targetSocket.emit("pc:access-revoked", {
+          pcDeviceId: targetPcId,
+          reason: "Authorization session expired",
+          timestamp: nowIso()
+        });
+
+        console.log(
+          "🔒 Expiry lock command sent to PC Agent"
+        );
+
+      }
+    }
+
+    addSecurityEvent(
+      "SESSION_EXPIRED",
+      "WARNING",
+      targetPcId,
+      "BioLock authorization session expired and PC was locked."
+    );
+
+    io.emit("pc:status-updated", {
+      pcDeviceId: targetPcId,
+      authorized: false,
+      authorizedDevice: null,
+      authorizedAt: null,
+      expiresAt: null,
+      status: "online"
+    });
+  }
+
+}, 10_000);
+
 server.listen(PORT,"0.0.0.0",() => {
-  console.log(`BioLock server running on https://findings-depending-takes-jelsoft.trycloudflare.com:${PORT}`);
+  console.log(`BioLock server running on https://captain-percentage-lone-surgeons.trycloudflare.com:${PORT}`);
   console.log("QR BASE URL:", PUBLIC_BASE_URL);
   console.log("MOBILE PATH:", MOBILE_PATH);
 });

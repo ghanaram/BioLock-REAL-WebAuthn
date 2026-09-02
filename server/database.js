@@ -72,6 +72,20 @@ CREATE TABLE IF NOT EXISTS security_events (
   message TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS pc_devices (
+  pc_device_id TEXT PRIMARY KEY,
+  hostname TEXT,
+  platform TEXT,
+  status TEXT DEFAULT 'offline',
+  authorized INTEGER DEFAULT 0,
+  authorized_device TEXT,
+  authorized_at TEXT,
+  last_seen TEXT,
+  created_at TEXT,
+  updated_at TEXT
+);
+
 `);
 
 module.exports = db;

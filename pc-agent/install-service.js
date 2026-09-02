@@ -14,7 +14,7 @@ const svc = new Service({
     },
     {
       name: "BIOLOCK_SERVER",
-      value: "https://automatic-informational-institution-favor.trycloudflare.com"
+      value: "https://captain-percentage-lone-surgeons.trycloudflare.com"
     }
   ]
 });
@@ -27,9 +27,12 @@ svc.on("install", () => {
   svc.start();
 });
 
-svc.on("alreadyinstalled", () => {
-  console.log("⚠️ BioLock service is already installed.");
-});
+
+// svc.on("uninstall", () => {
+//   console.log("=================================");
+//   console.log("✅ BIOLOCK SERVICE UNINSTALLED");
+//   console.log("=================================");
+// });
 
 svc.on("start", () => {
   console.log("🟢 BioLock PC Agent service STARTED");
@@ -40,5 +43,8 @@ svc.on("error", (err) => {
   console.error(err);
 });
 
-console.log("Installing BioLock PC Agent Windows Service...");
+console.log("installing BioLock PC Agent Windows Service...");
 svc.install();
+
+// console.log("Uninstalling BioLock PC Agent Windows Service...");
+// svc.uninstall();

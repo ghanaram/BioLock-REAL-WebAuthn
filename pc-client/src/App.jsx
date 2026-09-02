@@ -1,15 +1,56 @@
 import {useEffect,useMemo,useState} from 'react'
 import {ShieldCheck,LockKeyhole,Smartphone,Activity,Settings,AlertTriangle,CheckCircle2,XCircle,RefreshCw,Clock3,LogOut} from 'lucide-react'
 import {motion,AnimatePresence} from 'framer-motion'
+import React from "react";
 import {API,socket} from './services/socket'
+const AGENT_STATUS_URL = 'http://127.0.0.1:47821/status'
 
 const pcId='BIOLOCK-PC-01'
 const fmt=t=>new Date(t).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})
 export default function App(){
+ const [agentStatus,setAgentStatus]=useState(null)   
  const [page,setPage]=useState('lock'),[locked,setLocked]=useState(true),[request,setRequest]=useState(null)
  const [status,setStatus]=useState('Waiting for authorization...'),[events,setEvents]=useState([]),[devices,setDevices]=useState([])
  const [session,setSession]=useState(null),[connected,setConnected]=useState(false)
  const [seconds,setSeconds]=useState(0)
+ const [pcStatus, setPcStatus] = useState({
+  pcId: pcId,
+  hostname: "-",
+  platform: "-",
+  agentRunning: false,
+  socketConnected: false,
+  registered: false,
+  pcAuthorized: false,
+  authorizedDevice: null,
+  authorizationTime: null
+});
+
+const [lastSeen, setLastSeen] = useState(null);
+
+const loadPcStatus = async () => {
+  try {
+    const response = await fetch("http://127.0.0.1:47821/status", {
+      cache: "no-store"
+    });
+
+    if (!response.ok) {
+      throw new Error("Agent unavailable");
+    }
+
+    const data = await response.json();
+
+    setPcStatus(data);
+    setLastSeen(new Date());
+  } catch (error) {
+    setPcStatus(prev => ({
+      ...prev,
+      agentRunning: false,
+      socketConnected: false,
+      registered: false,
+      pcAuthorized: false
+    }));
+  }
+};
  const load=async()=>{try{setEvents(await (await fetch(`${API}/api/security-events`)).json());setDevices(await (await fetch(`${API}/api/devices`)).json())}catch{}}
  const newRequest=async()=>{try{const r=await fetch(`${API}/api/auth/request`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pcDeviceId:pcId})});const d=await r.json();setRequest(d);setStatus('Waiting for phone authorization...');window.history.replaceState({},'',`?request=${d.requestId}`);setLocked(true);setSeconds(60)}catch{setStatus('Server unavailable')}}
 //  useEffect(()=>{load();socket.on('connect',()=>setConnected(true));socket.on('disconnect',()=>setConnected(false))
@@ -20,6 +61,40 @@ export default function App(){
 //  return()=>socket.removeAllListeners()},[])
 useEffect(() => {
   load();
+
+  const checkAgentStatus = async () => {
+  try {
+    const r = await fetch(AGENT_STATUS_URL)
+    const d = await r.json()
+
+    console.log("🤖 PC AGENT STATUS:", d)
+
+    setAgentStatus((prev) => ({
+  ...d,
+  expiresAt: d.expiresAt ?? prev?.expiresAt ?? null,
+}));
+
+    if (d.pcAuthorized) {
+      setLocked(false)
+      setStatus("BIOLOCK UNLOCKED")
+
+      setSession({
+        device: d.authorizedDevice,
+        time: d.authorizationTime
+      })
+    } else {
+      setLocked(true)
+    }
+
+  } catch (e) {
+    console.log("⚠️ PC Agent unavailable")
+    setAgentStatus((prev) => prev);
+  }
+}
+
+checkAgentStatus()
+
+const agentTimer = setInterval(checkAgentStatus, 2000)
 
   socket.on("connect", () => {
     console.log("🟢 PC CLIENT SOCKET CONNECTED:", socket.id);
@@ -44,7 +119,88 @@ useEffect(() => {
     load();
   });
 
-  return () => socket.removeAllListeners();
+socket.on("pc:status-updated", (data) => {
+  console.log("🔄 PC STATUS UPDATED:", data);
+    console.log("⏰ EXPIRES AT:", data?.expiresAt);
+
+  setDevices((prev) =>
+    prev.map((pc) =>
+      pc.pc_device_id === data.pcDeviceId
+        ? {
+            ...pc,
+            authorized: data.authorized ? 1 : 0,
+            authorized_device: data.authorizedDevice,
+            authorized_at: data.authorizedAt,
+            expiresAt: data.expiresAt,
+            status: data.status,
+          }
+        : pc
+    )
+  );
+  setAgentStatus((prev) => {
+  const authorized = data.authorized === true;
+
+  return {
+    ...prev,
+    pcAuthorized: authorized,
+
+    authorizedDevice: authorized
+      ? (data.authorizedDevice ?? prev.authorizedDevice)
+      : null,
+
+    authorizationTime: authorized
+      ? (data.authorizedAt ?? prev.authorizationTime)
+      : null,
+
+    expiresAt: authorized
+      ? (data.expiresAt ?? prev.expiresAt)
+      : null,
+  };
+});
+});
+  socket.on("security:event-created", (event) => {
+
+  console.log("🔴 LIVE SECURITY EVENT:", event);
+
+  setEvents((prev) => {
+
+    // duplicate protection
+    if (prev.some((e) => e.id === event.id)) {
+      return prev;
+    }
+
+    return [
+      event,
+      ...prev
+    ].slice(0, 100);
+  });
+
+});
+  socket.on("pc:access-revoked", (d) => {
+  console.log("🔒 PC CLIENT ACCESS REVOKED:", d);
+
+  setLocked(true);
+  setSession(null);
+  setRequest(null);
+  setStatus("PC LOCKED");
+
+  load();
+
+loadPcStatus();
+
+
+const statusTimer = setInterval(() => {
+  loadPcStatus();
+  load();
+}, 2000);
+
+return () => {
+  clearInterval(statusTimer);
+  socket.removeAllListeners();
+};
+
+});
+  return () => {clearInterval(agentTimer);socket.off("pc:status-updated")}
 }, []);
  useEffect(()=>{if(!request||seconds<=0)return;const x=setInterval(()=>setSeconds(s=>s-1),1000);return()=>clearInterval(x)},[request,seconds])
  useEffect(()=>{if(seconds===0&&request)setStatus('QR CODE EXPIRED')},[seconds])
@@ -58,18 +214,86 @@ useEffect(() => {
    </div>
   </header>
   <main className="mx-auto max-w-7xl px-5 py-8">
-   {page==='lock'&&<Lock locked={locked} request={request} status={status} seconds={seconds} onNew={newRequest} session={session} onLogout={()=>{setLocked(true);setSession(null);setStatus('Waiting for authorization...')}}/>}
-   {page==='dashboard'&&<Dashboard events={events} devices={devices} onSimulate={simulate} onReset={reset}/>}
+   {page==='lock'&&<Lock locked={locked} request={request} status={status} seconds={seconds} onNew={newRequest} session={session} agentStatus={agentStatus} 
+   onLogout={async () => {
+  try {
+    await fetch(`${API}/api/auth/lock`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        pcDeviceId: pcId
+      })
+    });
+
+    setLocked(true);
+    setSession(null);
+    setRequest(null);
+    setStatus("PC LOCKED");
+  } catch (e) {
+    console.error("Lock failed:", e);
+  }
+}}/>}
+   {page==='dashboard'&&<Dashboard events={events} devices={devices} onSimulate={simulate} onReset={reset} agentStatus={agentStatus}/>}
    {page==='devices'&&<Devices devices={devices} load={load}/>}
   </main>
  </div>
 }
-function Lock({locked,request,status,seconds,onNew,session,onLogout}){
+function Lock({locked,request,status,seconds,onNew,session,agentStatus,onLogout}){
  return <section className="mx-auto max-w-5xl">
   <div className="mb-6 flex items-center justify-between"><div><p className="text-sm text-cyan-300">PROTECTED ENVIRONMENT</p><h1 className="mt-1 text-3xl font-bold md:text-5xl">Your Phone. Your Fingerprint. Your PC.</h1></div><span className={`rounded-full px-3 py-1 text-xs ${locked?'bg-red-400/10 text-red-300':'bg-emerald-400/10 text-emerald-300'}`}>{locked?'🔒 PC PROTECTED':'🟢 UNLOCKED'}</span></div>
   <div className="glass glow rounded-3xl p-6 md:p-10">
    <AnimatePresence mode="wait">{locked?<motion.div key="locked" initial={{opacity:0,y:12}} animate={{opacity:1,y:0}} className="grid gap-8 md:grid-cols-[1.2fr_.8fr]">
-    <div><div className="mb-6 flex h-28 w-28 items-center justify-center rounded-full border border-cyan-300/20 bg-cyan-300/5 text-cyan-300"><LockKeyhole size={52}/></div><p className="text-sm text-slate-400">Authentication</p><h2 className="text-2xl font-semibold">{status}</h2><div className="mt-7 grid grid-cols-2 gap-3"><Info label="Device" value="BIOLOCK-PC-01"/><Info label="Registered Phone" value="Ghanaram's Phone"/><Info label="Connection" value="Online"/><Info label="Method" value="Smartphone"/></div></div>
+    <div><div className="mb-6 flex h-28 w-28 items-center justify-center rounded-full border border-cyan-300/20 bg-cyan-300/5 text-cyan-300"><LockKeyhole size={52}/></div><p className="text-sm text-slate-400">Authentication</p><h2 className="text-2xl font-semibold">{status}</h2><div className="mt-7 grid grid-cols-2 gap-3">
+        <div className="mt-4 rounded-xl border border-cyan-300/10 bg-cyan-300/5 p-4">
+  <div className="flex items-center justify-between">
+    <div>
+      <p className="text-[10px] uppercase tracking-wider text-slate-500">
+        PC Agent
+      </p>
+
+      <p className="mt-1 text-sm font-medium">
+        {agentStatus?.agentRunning
+          ? agentStatus.pcAuthorized
+            ? "🟢 AUTHORIZED"
+            : "🔒 LOCKED"
+          : "⚠️ AGENT OFFLINE"}
+      </p>
+    </div>
+
+    <div
+      className={`h-3 w-3 rounded-full ${
+        agentStatus?.pcAuthorized
+          ? "bg-emerald-400"
+          : agentStatus?.agentRunning
+          ? "bg-amber-400"
+          : "bg-red-400"
+      }`}
+    />
+  </div>
+
+  {agentStatus?.pcAuthorized && (
+    <div className="mt-3 text-xs text-slate-400">
+      <p>
+        Authorized Device:{" "}
+        <span className="text-slate-200">
+          {agentStatus.authorizedDevice}
+        </span>
+      </p>
+
+      <p className="mt-1">
+        Authorization Time:{" "}
+        <span className="text-slate-200">
+          {agentStatus.authorizationTime
+            ? fmt(agentStatus.authorizationTime)
+            : "--"}
+        </span>
+      </p>
+    </div>
+  )}
+</div>
+        <Info label="Device" value="BIOLOCK-PC-01"/><Info label="Registered Phone" value={agentStatus?.authorizedDevice || "No active device"}/><Info label="Connection" value={agentStatus?.socketConnected && agentStatus?.registered? "Online" : "Ofline"}/><Info label="PC Authorization" value={agentStatus?.pcAuthorized? "AUTHORIZED" : "LOCKED"}/><Info label="Method" value="Smartphone"/></div></div>
     <div className="rounded-2xl border border-cyan-300/10 bg-black/20 p-5 text-center"><div className="mb-4 flex items-center justify-center gap-2 text-sm text-slate-300"><Smartphone size={16}/> Scan with your trusted smartphone</div>{request&&seconds>0?<img src={request.qrDataUrl} className="mx-auto w-64 rounded-xl bg-white p-3" alt="BioLock authorization QR"/>:<div className="mx-auto grid aspect-square w-64 place-items-center rounded-xl border border-dashed border-cyan-300/20 text-slate-500">QR READY</div>}<p className="mt-4 text-sm">{request&&seconds>0?`Expires in 00:${String(seconds).padStart(2,'0')}`:'Generate an authorization request'}</p><button onClick={onNew} className="mt-4 w-full rounded-xl bg-cyan-400 px-4 py-3 font-semibold text-slate-950 hover:bg-cyan-300"><RefreshCw className="mr-2 inline" size={16}/>Generate New QR</button><p className="mt-3 text-[11px] text-slate-500">Scan with your phone. The phone opens the real WebAuthn passkey authorization page.</p>
 <p className="mt-2 text-[10px] text-cyan-300/70">No fingerprint data is transmitted to BioLock.</p></div>
    </motion.div>:<motion.div key="open" initial={{opacity:0,scale:.96}} animate={{opacity:1,scale:1}} className="py-10 text-center"><CheckCircle2 className="mx-auto text-emerald-300" size={80}/><p className="mt-5 text-sm text-emerald-300">SECURE CHANNEL ESTABLISHED</p><h2 className="mt-2 text-4xl font-bold">BIOLOCK UNLOCKED</h2><p className="mx-auto mt-3 max-w-xl text-slate-400">The protected demo environment is active. No biometric data was received by this application.</p><div className="mx-auto mt-8 max-w-md rounded-2xl bg-white/5 p-5 text-left"><Info label="Authenticated Device" value={session?.device||"Trusted Phone"}/><Info label="Authentication Time" value={session?.time?fmt(session.time):"Now"}/><Info label="State" value="Active session"/></div><button onClick={onLogout} className="mt-6 rounded-xl border border-white/10 px-5 py-3 hover:bg-white/5"><LogOut className="mr-2 inline" size={16}/>Lock Now</button></motion.div>}</AnimatePresence>
@@ -77,9 +301,230 @@ function Lock({locked,request,status,seconds,onNew,session,onLogout}){
  </section>
 }
 function Info({label,value}){return <div className="rounded-xl bg-white/[.03] p-3"><p className="text-[10px] uppercase tracking-wider text-slate-500">{label}</p><p className="mt-1 text-sm font-medium text-slate-200">{value}</p></div>}
-function Dashboard({events,devices,onSimulate,onReset}){return <div><div className="flex flex-wrap items-end justify-between gap-4"><div><p className="text-sm text-cyan-300">SECURITY CENTER</p><h1 className="text-4xl font-bold">BioLock Dashboard</h1></div><div className="flex gap-2"><button onClick={onSimulate} className="rounded-xl border border-red-300/20 bg-red-400/10 px-4 py-3 text-sm text-red-200"><AlertTriangle className="mr-2 inline" size={16}/>Simulate Unauthorized Attempt</button><button onClick={onReset} className="rounded-xl border border-white/10 px-4 py-3 text-sm"><RefreshCw className="mr-2 inline" size={16}/>Reset Demo</button></div></div>
-<div className="mt-8 grid gap-4 sm:grid-cols-2 lg:grid-cols-4"><Stat icon={<LockKeyhole/>} label="PC STATUS" value="Protected"/><Stat icon={<Smartphone/>} label="PHONE STATUS" value="Trusted"/><Stat icon={<CheckCircle2/>} label="AUTHENTICATIONS" value={events.filter(x=>x.event_type==='SUCCESS').length}/><Stat icon={<XCircle/>} label="SECURITY EVENTS" value={events.length}/></div>
-<div className="mt-6 grid gap-6 lg:grid-cols-[1.3fr_.7fr]"><div className="glass rounded-2xl p-6"><h2 className="text-xl font-semibold">Recent Security Activity</h2><div className="mt-4 space-y-3">{events.slice(0,8).map((e,i)=><div key={i} className="flex items-start gap-3 rounded-xl bg-white/[.03] p-4"><div>{e.severity==='CRITICAL'?<AlertTriangle className="text-red-300"/>:e.event_type==='DENIED'?<XCircle className="text-amber-300"/>:<Activity className="text-cyan-300"/>}</div><div className="flex-1"><div className="flex justify-between gap-3"><b>{e.event_type}</b><span className="text-xs text-slate-500">{fmt(e.created_at)}</span></div><p className="text-sm text-slate-400">{e.message}</p></div></div>)}{events.length===0&&<p className="py-8 text-center text-slate-500">No events yet.</p>}</div></div>
+function getRemainingSession(expiresAt) {
+  if (!expiresAt) return null;
+
+  const remaining = Math.max(
+    0,
+    new Date(expiresAt).getTime() - Date.now()
+  );
+
+  const totalSeconds = Math.floor(remaining / 1000);
+
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+
+  return {
+    expired: remaining <= 0,
+    text: `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`,
+  };
+}
+function Dashboard({events,devices,onSimulate,onReset,agentStatus}){ const [remainingSession, setRemainingSession] = React.useState(null);  const isAuthorized = agentStatus?.pcAuthorized === true;
+React.useEffect(() => {
+
+  const updateCountdown = () => {
+
+    console.log("⏱️ COUNTDOWN STATE:", {
+      authorized: agentStatus?.pcAuthorized,
+      expiresAt: agentStatus?.expiresAt,
+    });
+
+    if (
+      !agentStatus?.pcAuthorized ||
+      !agentStatus?.expiresAt
+    ) {
+      setRemainingSession(null);
+      return;
+    }
+
+    const result = getRemainingSession(
+      agentStatus.expiresAt
+    );
+
+    console.log("⏳ REMAINING:", result);
+
+    setRemainingSession(result);
+  };
+
+  updateCountdown();
+
+  const timer = setInterval(
+    updateCountdown,
+    1000
+  );
+
+  return () => clearInterval(timer);
+
+}, [
+  agentStatus?.pcAuthorized,
+  agentStatus?.expiresAt
+]);
+return <div><div className="flex flex-wrap items-end justify-between gap-4"><div><p className="text-sm text-cyan-300">SECURITY CENTER</p><h1 className="text-4xl font-bold">BioLock Dashboard</h1></div><div className="flex gap-2"><button onClick={onSimulate} className="rounded-xl border border-red-300/20 bg-red-400/10 px-4 py-3 text-sm text-red-200"><AlertTriangle className="mr-2 inline" size={16}/>Simulate Unauthorized Attempt</button>
+<button
+  onClick={async () => {
+    const pcId =
+      agentStatus?.pcId || "BIOLOCK-PC-01";
+
+    const confirmed =
+      window.confirm(
+        `Lock ${pcId} now?`
+      );
+
+    if (!confirmed) return;
+
+    try {
+      const response = await fetch(
+        `${API}/api/pcs/${encodeURIComponent(pcId)}/lock`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+        }
+      );
+
+      const data = await response.json();
+
+      if (!response.ok || !data.ok) {
+        throw new Error(
+          data.error || "Failed to lock PC"
+        );
+      }
+
+      console.log(
+        "🔒 PC LOCKED:",
+        data
+      );
+
+    } catch (error) {
+      console.error(
+        "❌ LOCK NOW failed:",
+        error
+      );
+
+      alert(
+        `Failed to lock PC: ${error.message}`
+      );
+    }
+  }}
+  disabled={!agentStatus?.socketConnected}
+  className="rounded-xl border border-red-300/20 bg-red-400/10 px-4 py-3 text-sm text-red-200 hover:bg-red-400/20 disabled:cursor-not-allowed disabled:opacity-40"
+>
+  <LockKeyhole
+    className="mr-2 inline"
+    size={16}
+  />
+  LOCK NOW
+</button>
+
+<button onClick={onReset} className="rounded-xl border border-white/10 px-4 py-3 text-sm"><RefreshCw className="mr-2 inline" size={16}/>Reset Demo</button></div></div>
+<div className="mt-8 grid gap-4 sm:grid-cols-2 lg:grid-cols-4"><Stat icon={<LockKeyhole/>} label="PC STATUS" value={!agentStatus?.agentRunning ? "Offline" : agentStatus?.pcAuthorized ? "Authorized" : "locked"}/><Stat icon={<Smartphone/>} label="PHONE STATUS" value="Trusted"/><Stat icon={<CheckCircle2/>} label="AUTHENTICATIONS" value={events.filter(x=>x.event_type==='SUCCESS').length}/><Stat icon={<XCircle/>} label="SECURITY EVENTS" value={events.length}/></div>
+
+<div className="mt-6 glass rounded-2xl p-6">
+  <div className="flex items-center justify-between">
+    <div>
+      <p className="text-sm text-cyan-300">LIVE AGENT MONITOR</p>
+      <h2 className="mt-1 text-xl font-semibold">
+        {agentStatus?.hostname || "Unknown PC"}
+      </h2>
+    </div>
+
+    <span
+      className={`rounded-full px-3 py-1 text-xs ${
+        agentStatus?.socketConnected && agentStatus?.registered
+          ? "bg-emerald-400/10 text-emerald-300"
+          : "bg-red-400/10 text-red-300"
+      }`}
+    >
+      ●{" "}
+      {agentStatus?.socketConnected && agentStatus?.registered
+        ? "ONLINE"
+        : "OFFLINE"}
+    </span>
+  </div>
+
+  <div className="mt-5 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+    <Info
+      label="PC ID"
+      value={agentStatus?.pcId || "BIOLOCK-PC-01"}
+    />
+
+    <Info
+      label="Platform"
+      value={agentStatus?.platform || "Windows"}
+    />
+
+    <Info
+      label="Authorization"
+      value={
+        agentStatus?.pcAuthorized
+          ? "AUTHORIZED"
+          : "LOCKED"
+      }
+    />
+
+    <Info
+      label="Authorized Device"
+      value={
+        agentStatus?.authorizedDevice || "None"
+      }
+    />
+    <Info
+  label="SESSION"
+  value={
+    agentStatus?.pcAuthorized
+      ? remainingSession?.text || "CALCULATING..."
+      : "LOCKED"
+  }
+/>
+  </div>
+</div>
+<div className="mt-6 grid gap-6 lg:grid-cols-[1.3fr_.7fr]"><div className="glass rounded-2xl p-6"><h2 className="text-xl font-semibold">Recent Security Activity</h2><span className="flex items-center gap-2 rounded-full bg-emerald-400/10 px-3 py-1 text-[10px] text-emerald-300">
+    <span className="h-2 w-2 animate-pulse rounded-full bg-emerald-300" />
+    LIVE
+  </span><div className="mt-5 space-y-3">
+{events.slice(0, 8).map((e, i) => (
+  <motion.div
+    key={e.id || i}
+    initial={{ opacity: 0, x: -10 }}
+    animate={{ opacity: 1, x: 0 }}
+    className="flex items-start gap-3 rounded-xl bg-white/[.03] p-4"
+  >
+    <div className="mt-1">
+      {e.severity === "CRITICAL" ? (
+        <AlertTriangle className="text-red-300" />
+      ) : e.event_type === "DENIED" ? (
+        <XCircle className="text-amber-300" />
+      ) : e.event_type === "SUCCESS" ? (
+        <CheckCircle2 className="text-emerald-300" />
+      ) : (
+        <Activity className="text-cyan-300" />
+      )}
+    </div>
+
+    <div className="flex-1">
+      <div className="flex justify-between gap-3">
+        <b>{e.event_type}</b>
+
+        <span className="text-xs text-slate-500">
+          {fmt(e.created_at)}
+        </span>
+      </div>
+
+      <p className="mt-1 text-sm text-slate-400">
+        {e.message}
+      </p>
+
+      {e.device_id && (
+        <p className="mt-2 text-[10px] text-cyan-300/70">
+          DEVICE: {e.device_id}
+        </p>
+      )}
+    </div>
+  </motion.div>
+))}
+    </div></div>
 <div className="glass rounded-2xl p-6"><h2 className="text-xl font-semibold">AI Security Insight</h2><div className="mt-5 rounded-xl border border-cyan-300/10 bg-cyan-300/5 p-4"><p className="text-sm text-cyan-100">Prototype Security Insight</p><p className="mt-2 text-sm text-slate-400">{events.filter(e=>['DENIED','RECOVERY_FAILED','UNAUTHORIZED'].includes(e.event_type)).length>=3?'Multiple denied/failed events were detected. This pattern may indicate an unauthorized access attempt.':'No suspicious pattern detected in the current demo logs.'}</p></div><h2 className="mt-8 text-xl font-semibold">Trusted Devices</h2><div className="mt-3 space-y-2">{devices.map(d=><div key={d.device_id} className="rounded-xl bg-white/[.03] p-3"><p className="font-medium">{d.device_name}</p><p className="text-xs text-emerald-300">● {d.trust_status||'Active'}</p></div>)}</div></div></div></div>}
 function Stat({icon,label,value}){return <div className="glass rounded-2xl p-5"><div className="text-cyan-300">{icon}</div><p className="mt-4 text-[11px] tracking-wider text-slate-500">{label}</p><p className="mt-1 text-2xl font-bold">{value}</p></div>}
-function Devices({devices,load}){const remove=async id=>{await fetch(`${API}/api/devices/${id}`,{method:'DELETE'});load()};return <div><p className="text-sm text-cyan-300">TRUST MANAGEMENT</p><h1 className="text-4xl font-bold">Trusted Devices</h1><div className="mt-8 grid gap-4 md:grid-cols-2">{devices.map(d=><div className="glass rounded-2xl p-6" key={d.device_id}><div className="flex items-start justify-between"><div className="flex gap-4"><div className="rounded-xl bg-cyan-300/10 p-3 text-cyan-300">{d.device_type==='phone'?<Smartphone/>:<ShieldCheck/>}</div><div><h2 className="font-semibold">{d.device_name}</h2><p className="mt-1 text-sm text-emerald-300">● Trusted</p></div></div><button onClick={()=>remove(d.device_id)} className="text-xs text-red-300">Remove</button></div><div className="mt-5 grid grid-cols-2 gap-3"><Info label="Owner" value={d.owner_name||'Ghanaram'}/><Info label="Auth" value={d.authentication_method||'Passkey'}/></div></div>)}</div></div>}
+function Devices({devices,load}){const remove=async id=>{await fetch(`${API}/api/devices/${id}`,{method:'DELETE'});load()};return <div><p className="text-sm text-cyan-300">TRUST MANAGEMENT</p><h1 className="text-4xl font-bold">Trusted Devices</h1><div className="mt-8 grid gap-4 md:grid-cols-2">
+    {devices.map(d=><div className="glass rounded-2xl p-6" key={d.device_id}><div className="flex items-start justify-between"><div className="flex gap-4"><div className="rounded-xl bg-cyan-300/10 p-3 text-cyan-300">{d.device_type==='phone'?<Smartphone/>:<ShieldCheck/>}</div><div><h2 className="font-semibold">{d.device_name}</h2><p className="mt-1 text-sm text-emerald-300">● Trusted</p></div></div><button onClick={()=>remove(d.device_id)} className="text-xs text-red-300">Remove</button></div><div className="mt-5 grid grid-cols-2 gap-3"><Info label="Owner" value={d.owner_name||'Ghanaram'}/><Info label="Auth" value={d.authentication_method||'Passkey'}/></div></div>)}</div></div>}
