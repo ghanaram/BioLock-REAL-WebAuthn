@@ -41,7 +41,7 @@ cert: fs.readFileSync(
 const PORT = Number(process.env.PORT || 5000);
 const RP_NAME = process.env.RP_NAME || "BioLock";
 const RP_ID = process.env.RP_ID || "localhost";
-const ORIGIN = process.env.ORIGIN || "https://captain-percentage-lone-surgeons.trycloudflare.com";
+const ORIGIN = process.env.ORIGIN || "https://suit-entity-granny-finally.trycloudflare.com";
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || ORIGIN;
 const MOBILE_PATH = process.env.MOBILE_PATH || "/mobile/";
 const AUTH_SESSION_MS = Number(process.env.AUTH_SESSION_MINUTES || 30) * 60 * 1000;
@@ -201,7 +201,7 @@ app.get("/api/webauthn/register/options", async (req,res)=>{
       },
       supportedAlgorithmIDs:[-7,-257]
     });
-    saveChallenge("registration",options.challenge);
+    saveChallenge("registration",options.challenge,deviceId);
     res.json(options);
   }catch(e){res.status(500).json({error:e.message})}
 });
@@ -297,29 +297,60 @@ app.post("/api/webauthn/auth/options", async (req, res) => {
       });
     }
 
-    // Find trusted phone passkey
-    const passkey = db
-      .prepare(`
-        SELECT *
-        FROM passkeys
-        WHERE device_id=?
-        LIMIT 1
-      `)
-      .get(deviceId);
+    // Find trusted device
+const trustedDevice = db
+  .prepare(`
+    SELECT *
+    FROM trusted_devices
+    WHERE device_id=?
+    LIMIT 1
+  `)
+  .get(deviceId);
 
-    if (!passkey) {
-      addSecurityEvent(
-        "UNAUTHORIZED",
-        "WARNING",
-        deviceId,
-        "Authentication attempted without a registered passkey."
-      );
+// Block revoked / unknown device
+if (!trustedDevice || trustedDevice.status !== "trusted") {
 
-      return res.status(404).json({
-        success: false,
-        error: "No passkey registered for this phone",
-      });
-    }
+  addSecurityEvent(
+    "UNAUTHORIZED",
+    "WARNING",
+    deviceId,
+    !trustedDevice
+      ? "Authentication attempted from an unknown device."
+      : `Revoked device ${deviceId} attempted authentication.`
+  );
+
+  return res.status(403).json({
+    success: false,
+    error: !trustedDevice
+      ? "Device is not trusted"
+      : "Device trust has been revoked",
+  });
+}
+
+// Find trusted phone passkey
+const passkey = db
+  .prepare(`
+    SELECT *
+    FROM passkeys
+    WHERE device_id=?
+    LIMIT 1
+  `)
+  .get(deviceId);
+
+if (!passkey) {
+
+  addSecurityEvent(
+    "UNAUTHORIZED",
+    "WARNING",
+    deviceId,
+    "Trusted device has no registered passkey."
+  );
+
+  return res.status(404).json({
+    success: false,
+    error: "No passkey registered for this phone",
+  });
+}
 
     // Generate fresh WebAuthn challenge
     const options =
@@ -982,31 +1013,6 @@ addSecurityEvent(
   }
 });
 
-// app.get("/api/webauthn/auth/options", async (req,res)=>{
-//   try{
-//     const requestId=String(req.query.requestId||"");
-//     const phoneDeviceId=String(req.query.deviceId||"GHANARAM-PHONE");
-//     const row=db.prepare("SELECT * FROM auth_requests WHERE request_id=?").get(requestId);
-//     if(!row) return res.status(404).json({error:"Unknown request"});
-//     if(row.status!=="pending") return res.status(409).json({error:"Request is no longer pending"});
-//     if(Date.now()>row.expires_at){
-//       db.prepare("UPDATE auth_requests SET status='expired' WHERE request_id=?").run(requestId);
-//       return res.status(410).json({error:"Authentication request expired"});
-//     }
-//     const passkeys=getPasskeys(phoneDeviceId);
-//     if(!passkeys.length) return res.status(404).json({error:"No passkey registered for this phone"});
-//     const options=await generateAuthenticationOptions({
-//       rpID:RP_ID,
-//       userVerification:"required",
-//       allowCredentials:passkeys.map(p=>({id:p.id,transports:p.transports?JSON.parse(p.transports):undefined}))
-//     });
-//     saveChallenge("authentication",options.challenge,requestId);
-//     res.json(options);
-//   }catch(e){res.status(500).json({error:e.message})}
-// });
-
-
-
 app.post("/api/auth/request", async (req, res) => {
   const pcDeviceId = String(
     req.body.pcDeviceId || "BIOLOCK-PC-01"
@@ -1236,6 +1242,233 @@ app.get("/api/devices", (_,res) => {
   res.json(devices);
 });
 
+// ==========================================
+// DEVICE DETAILS
+// ==========================================
+
+app.get("/api/devices/:deviceId", (req, res) => {
+  try {
+    const deviceId = String(req.params.deviceId || "").trim();
+
+    if (!deviceId) {
+      return res.status(400).json({
+        ok: false,
+        error: "Missing device ID"
+      });
+    }
+
+    const device = db.prepare(`
+      SELECT
+        d.device_id,
+        d.device_type,
+        d.device_name,
+        d.status AS device_status,
+        d.created_at,
+        d.last_seen,
+
+        t.owner_name,
+        t.authentication_method,
+        t.status AS trust_status,
+        t.paired_at,
+
+        CASE
+          WHEN p.id IS NOT NULL THEN 1
+          ELSE 0
+        END AS passkey_registered
+
+      FROM devices d
+
+      LEFT JOIN trusted_devices t
+        ON d.device_id = t.device_id
+
+      LEFT JOIN passkeys p
+        ON d.device_id = p.device_id
+
+      WHERE d.device_id = ?
+
+      LIMIT 1
+    `).get(deviceId);
+
+    if (!device) {
+      return res.status(404).json({
+        ok: false,
+        error: "Device not found"
+      });
+    }
+
+    let pc = null;
+
+    if (device.device_type === "pc") {
+      pc = db.prepare(`
+        SELECT
+          pc_device_id,
+          hostname,
+          platform,
+          status,
+          authorized,
+          authorized_device,
+          authorized_at,
+          last_seen,
+          created_at,
+          updated_at
+        FROM pc_devices
+        WHERE pc_device_id = ?
+      `).get(deviceId);
+    }
+
+    return res.json({
+      ok: true,
+
+      device: {
+        deviceId: device.device_id,
+        type: device.device_type,
+        name: device.device_name,
+        status: device.device_status,
+        createdAt: device.created_at,
+        lastSeen: device.last_seen,
+
+        trust: {
+          ownerName: device.owner_name || null,
+          authenticationMethod:
+            device.authentication_method || null,
+          status: device.trust_status || null,
+          pairedAt: device.paired_at || null
+        },
+
+        passkeyRegistered:
+          Number(device.passkey_registered) === 1
+      },
+
+      pc: pc
+        ? {
+            pcDeviceId: pc.pc_device_id,
+            hostname: pc.hostname,
+            platform: pc.platform,
+            status: pc.status,
+            authorized: Number(pc.authorized) === 1,
+            authorizedDevice:
+              pc.authorized_device || null,
+            authorizedAt:
+              pc.authorized_at || null,
+            lastSeen: pc.last_seen,
+            createdAt: pc.created_at,
+            updatedAt: pc.updated_at
+          }
+        : null
+    });
+
+  } catch (e) {
+    console.error("❌ Device details error:", e);
+
+    return res.status(500).json({
+      ok: false,
+      error: e.message
+    });
+  }
+});
+
+// ==================================================
+// RE-TRUST DEVICE
+// ==================================================
+
+app.post("/api/devices/:deviceId/retrust", (req, res) => {
+  try {
+    const deviceId = String(req.params.deviceId || "").trim();
+
+    if (!deviceId) {
+      return res.status(400).json({
+        ok: false,
+        error: "Missing device ID",
+      });
+    }
+
+    const device = db.prepare(`
+      SELECT *
+      FROM devices
+      WHERE device_id = ?
+    `).get(deviceId);
+
+    if (!device) {
+      return res.status(404).json({
+        ok: false,
+        error: "Device not found",
+      });
+    }
+
+    const trustedDevice = db.prepare(`
+      SELECT *
+      FROM trusted_devices
+      WHERE device_id = ?
+    `).get(deviceId);
+
+    if (!trustedDevice) {
+      return res.status(404).json({
+        ok: false,
+        error: "Trusted device record not found",
+      });
+    }
+
+    // Check whether a WebAuthn credential still exists
+    const passkey = db.prepare(`
+      SELECT id
+      FROM passkeys
+      WHERE device_id = ?
+      LIMIT 1
+    `).get(deviceId);
+
+    // Restore trust
+    db.prepare(`
+      UPDATE trusted_devices
+      SET status = 'trusted'
+      WHERE device_id = ?
+    `).run(deviceId);
+
+    addSecurityEvent(
+      "DEVICE_RETRUSTED",
+      "INFO",
+      deviceId,
+      `Trusted device ${deviceId} was re-trusted.`
+    );
+
+    io.emit("device:retrusted", {
+      deviceId,
+      timestamp: nowIso(),
+    });
+
+    console.log("======================================");
+    console.log("🔐 BIOLOCK DEVICE RE-TRUSTED");
+    console.log("======================================");
+    console.log("Device :", deviceId);
+    console.log("Action :", "TRUST RESTORED");
+    console.log(
+      "Passkey:",
+      passkey ? "AVAILABLE" : "NOT AVAILABLE"
+    );
+    console.log("======================================");
+
+    return res.json({
+      ok: true,
+      retrusted: true,
+      deviceId,
+      passkeyAvailable: !!passkey,
+      message: passkey
+        ? "Trusted device re-trusted successfully"
+        : "Device re-trusted, but a new passkey registration is required",
+    });
+
+  } catch (e) {
+    console.error(
+      "❌ Device re-trust error:",
+      e
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error: "Unable to re-trust device",
+    });
+  }
+});
+
 app.get("/api/pcs", (req, res) => {
   try {
     const pcs = db.prepare(`
@@ -1387,7 +1620,100 @@ app.post("/api/pcs/:pcDeviceId/lock", (req, res) => {
   }
 });
 
+// ==========================================
+// REVOKE TRUSTED DEVICE
+// ==========================================
 
+app.post("/api/devices/:deviceId/revoke", (req, res) => {
+  try {
+    const deviceId = String(req.params.deviceId || "").trim();
+
+    if (!deviceId) {
+      return res.status(400).json({
+        ok: false,
+        error: "Missing device ID"
+      });
+    }
+
+    const device = db.prepare(`
+      SELECT *
+      FROM devices
+      WHERE device_id = ?
+    `).get(deviceId);
+
+    if (!device) {
+      return res.status(404).json({
+        ok: false,
+        error: "Device not found"
+      });
+    }
+
+    // Only trusted phone devices can be revoked
+    const trustedDevice = db.prepare(`
+      SELECT *
+      FROM trusted_devices
+      WHERE device_id = ?
+    `).get(deviceId);
+
+    if (!trustedDevice) {
+      return res.status(404).json({
+        ok: false,
+        error: "Trusted device not found"
+      });
+    }
+
+    // Revoke trust
+    db.prepare(`
+      UPDATE trusted_devices
+      SET status = 'revoked'
+      WHERE device_id = ?
+    `).run(deviceId);
+
+    // Disable registered passkeys for this device
+    db.prepare(`
+      DELETE FROM passkeys
+      WHERE device_id = ?
+    `).run(deviceId);
+
+    // Security audit event
+    addSecurityEvent(
+      "DEVICE_REVOKED",
+      "WARNING",
+      deviceId,
+      `Trusted device ${deviceId} was revoked.`
+    );
+
+    // Notify connected clients
+    io.emit("device:revoked", {
+      deviceId,
+      timestamp: nowIso()
+    });
+
+    console.log("");
+    console.log("======================================");
+    console.log("🚫 BIOLOCK DEVICE REVOKED");
+    console.log("======================================");
+    console.log("Device :", deviceId);
+    console.log("Action : TRUST REVOKED");
+    console.log("Passkey: REMOVED");
+    console.log("======================================");
+
+    return res.json({
+      ok: true,
+      revoked: true,
+      deviceId,
+      message: "Trusted device revoked successfully"
+    });
+
+  } catch (e) {
+    console.error("❌ Device revoke error:", e);
+
+    return res.status(500).json({
+      ok: false,
+      error: e.message
+    });
+  }
+});
 
 app.delete("/api/devices/:id", (req,res) => {
   const id = String(req.params.id);
@@ -1950,7 +2276,7 @@ setInterval(() => {
 }, 10_000);
 
 server.listen(PORT,"0.0.0.0",() => {
-  console.log(`BioLock server running on https://captain-percentage-lone-surgeons.trycloudflare.com:${PORT}`);
+  console.log(`BioLock server running on https://suit-entity-granny-finally.trycloudflare.com:${PORT}`);
   console.log("QR BASE URL:", PUBLIC_BASE_URL);
   console.log("MOBILE PATH:", MOBILE_PATH);
 });

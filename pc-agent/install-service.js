@@ -14,7 +14,7 @@ const svc = new Service({
     },
     {
       name: "BIOLOCK_SERVER",
-      value: "https://captain-percentage-lone-surgeons.trycloudflare.com"
+      value: "https://suit-entity-granny-finally.trycloudflare.com"
     }
   ]
 });

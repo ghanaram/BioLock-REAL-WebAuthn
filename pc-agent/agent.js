@@ -7,7 +7,7 @@ const AGENT_PORT = 47821;
 
 const API =
   process.env.BIOLOCK_SERVER ||
-  "https://captain-percentage-lone-surgeons.trycloudflare.com";
+  "https://suit-entity-granny-finally.trycloudflare.com";
 
 const PC_ID =
   process.env.BIOLOCK_PC_ID ||
