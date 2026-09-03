@@ -41,7 +41,7 @@ cert: fs.readFileSync(
 const PORT = Number(process.env.PORT || 5000);
 const RP_NAME = process.env.RP_NAME || "BioLock";
 const RP_ID = process.env.RP_ID || "localhost";
-const ORIGIN = process.env.ORIGIN || "https://suit-entity-granny-finally.trycloudflare.com";
+const ORIGIN = process.env.ORIGIN || "https://soma-beam-fragrance-wanting.trycloudflare.com";
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || ORIGIN;
 const MOBILE_PATH = process.env.MOBILE_PATH || "/mobile/";
 const AUTH_SESSION_MS = Number(process.env.AUTH_SESSION_MINUTES || 30) * 60 * 1000;
@@ -95,6 +95,96 @@ if (typeof io !== "undefined") {
 
   console.log("📡 LIVE SECURITY EVENT:", event);
 }
+
+const finalizeAuthentication = db.transaction(({
+  challengeId,
+  passkeyId,
+  newCounter,
+  requestId,
+  deviceId,
+  targetPcId,
+  authorizationTime,
+}) => {
+
+  // 1. FINAL TRUST CHECK — transaction ke andar
+  const trust = db.prepare(`
+    SELECT status
+    FROM trusted_devices
+    WHERE device_id=?
+    LIMIT 1
+  `).get(deviceId);
+
+  if (!trust || trust.status !== "trusted") {
+    throw new Error("DEVICE_TRUST_REVOKED");
+  }
+
+  // 2. Consume challenge atomically
+  const challengeUpdate = db.prepare(`
+    UPDATE webauthn_challenges
+    SET used=1
+    WHERE id=? AND used=0
+  `).run(challengeId);
+
+  if (challengeUpdate.changes !== 1) {
+    throw new Error("AUTH_CHALLENGE_ALREADY_USED");
+  }
+
+  // 3. Approve authentication request atomically
+  const requestUpdate = db.prepare(`
+    UPDATE auth_requests
+    SET phone_device_id=?,
+        status='approved',
+        used_at=?
+    WHERE request_id=?
+      AND status='pending'
+  `).run(
+    deviceId,
+    authorizationTime,
+    requestId
+  );
+
+  if (requestUpdate.changes !== 1) {
+    throw new Error("AUTH_REQUEST_ALREADY_USED");
+  }
+
+  // 4. Update WebAuthn counter
+  const counterUpdate = db.prepare(`
+    UPDATE passkeys
+    SET counter=?
+    WHERE id=?
+  `).run(
+    newCounter,
+    passkeyId
+  );
+
+  if (counterUpdate.changes !== 1) {
+    throw new Error("PASSKEY_UPDATE_FAILED");
+  }
+
+  // 5. Authorize target PC
+  const pcUpdate = db.prepare(`
+    UPDATE pc_devices
+    SET authorized=1,
+        authorized_device=?,
+        authorized_at=?,
+        status='online',
+        last_seen=?,
+        updated_at=?
+    WHERE pc_device_id=?
+  `).run(
+    deviceId,
+    authorizationTime,
+    authorizationTime,
+    authorizationTime,
+    targetPcId
+  );
+
+  if (pcUpdate.changes !== 1) {
+    throw new Error("PC_DEVICE_NOT_FOUND");
+  }
+
+  return true;
+});
 
 const ensureDevice = (deviceId, type, name) => {
   const existing = db.prepare("SELECT * FROM devices WHERE device_id=?").get(deviceId);
@@ -210,11 +300,56 @@ app.post("/api/webauthn/register/verify", async (req,res)=>{
   try{
     const deviceId=String(req.body.deviceId||"GHANARAM-PHONE");
     const response=req.body.response;
-    // The challenge is extracted by SimpleWebAuthn verification from the response;
-    // use the newest unconsumed registration challenge for this demo user.
-    const row=db.prepare(`SELECT * FROM webauthn_challenges
-      WHERE kind='registration' AND used=0 ORDER BY id DESC LIMIT 1`).get();
-    if(!row || Date.now()>row.expires_at) return res.status(400).json({error:"Registration challenge expired"});
+    
+    // --------------------------------------------------
+// Registration challenge must belong to this device
+// --------------------------------------------------
+
+const row = db.prepare(`
+  SELECT *
+  FROM webauthn_challenges
+  WHERE kind='registration'
+    AND request_id=?
+    AND used=0
+  ORDER BY id DESC
+  LIMIT 1
+`).get(deviceId);
+
+if (!row) {
+  addSecurityEvent(
+    "UNAUTHORIZED",
+    "WARNING",
+    deviceId,
+    "Registration attempted without a valid device-bound challenge."
+  );
+
+  return res.status(400).json({
+    verified: false,
+    error: "No active registration challenge for this device"
+  });
+}
+
+if (Date.now() > row.expires_at) {
+
+  db.prepare(`
+    UPDATE webauthn_challenges
+    SET used=1
+    WHERE id=? AND used=0
+  `).run(row.id);
+
+  addSecurityEvent(
+    "EXPIRED",
+    "WARNING",
+    deviceId,
+    "Registration challenge expired."
+  );
+
+  return res.status(410).json({
+    verified: false,
+    error: "Registration challenge expired"
+  });
+}
+
     const verification=await verifyRegistrationResponse({
       response,
       expectedChallenge:row.challenge,
@@ -223,7 +358,27 @@ app.post("/api/webauthn/register/verify", async (req,res)=>{
       requireUserVerification:true
     });
     if(!verification.verified) return res.status(400).json({error:"Passkey registration was not verified"});
-    db.prepare("UPDATE webauthn_challenges SET used=1 WHERE id=?").run(row.id);
+    
+    const challengeUpdate = db.prepare(`
+  UPDATE webauthn_challenges
+  SET used=1
+  WHERE id=? AND used=0
+`).run(row.id);
+
+if (challengeUpdate.changes !== 1) {
+  addSecurityEvent(
+    "REPLAY",
+    "WARNING",
+    deviceId,
+    "Registration challenge was already consumed."
+  );
+
+  return res.status(409).json({
+    verified: false,
+    error: "Registration challenge already used"
+  });
+}
+
     const {credential}=verification.registrationInfo;
     db.prepare(`INSERT OR REPLACE INTO passkeys
       (id,device_id,public_key,counter,transports,created_at) VALUES(?,?,?,?,?,?)`)
@@ -555,6 +710,37 @@ app.post("/api/webauthn/auth/verify", async (req, res) => {
       });
     }
 
+    // -----------------------------------------
+// FINAL DEVICE TRUST CHECK
+// -----------------------------------------
+
+const trustedDevice = db.prepare(`
+  SELECT status
+  FROM trusted_devices
+  WHERE device_id = ?
+  LIMIT 1
+`).get(deviceId);
+
+if (!trustedDevice || trustedDevice.status !== "trusted") {
+
+  addSecurityEvent(
+    "UNAUTHORIZED",
+    "WARNING",
+    deviceId,
+    !trustedDevice
+      ? "Authentication rejected: trusted device record not found."
+      : `Authentication rejected: device ${deviceId} is no longer trusted.`
+  );
+
+  return res.status(403).json({
+    verified: false,
+    success: false,
+    error: !trustedDevice
+      ? "Device is not trusted"
+      : "Device trust has been revoked"
+  });
+}
+
     // --------------------------------------------------
     // 6. Find exact registered credential
     // --------------------------------------------------
@@ -656,6 +842,50 @@ app.post("/api/webauthn/auth/verify", async (req, res) => {
         error: "WebAuthn verification failed",
       });
     }
+
+// --------------------------------------------------
+// FINAL AUTHORIZATION TRUST CHECK
+// --------------------------------------------------
+
+const finalTrust = db.prepare(`
+  SELECT status
+  FROM trusted_devices
+  WHERE device_id = ?
+  LIMIT 1
+`).get(deviceId);
+
+if (!finalTrust || finalTrust.status !== "trusted") {
+
+  // Consume the challenge so it cannot be reused
+  db.prepare(`
+    UPDATE webauthn_challenges
+    SET used=1
+    WHERE id=?
+  `).run(challengeRow.id);
+
+  addSecurityEvent(
+    "UNAUTHORIZED",
+    "CRITICAL",
+    deviceId,
+    `WebAuthn credential verified, but device ${deviceId} is no longer trusted. Authorization denied.`
+  );
+
+  console.log("");
+  console.log("======================================");
+  console.log("🚫 FINAL TRUST CHECK FAILED");
+  console.log("======================================");
+  console.log("Device :", deviceId);
+  console.log("Reason :", "DEVICE_NOT_TRUSTED");
+  console.log("Action :", "AUTHORIZATION DENIED");
+  console.log("======================================");
+
+  return res.status(403).json({
+    verified: false,
+    authorized: false,
+    error: "Device trust has been revoked"
+  });
+}
+
     addSecurityEvent(
   "PASSKEY_VERIFIED",
   "INFO",
@@ -663,52 +893,8 @@ app.post("/api/webauthn/auth/verify", async (req, res) => {
   "WebAuthn passkey verified successfully."
 );
 
-    // --------------------------------------------------
-    // 8. Consume challenge
-    // --------------------------------------------------
-
-    db.prepare(`
-      UPDATE webauthn_challenges
-      SET used=1
-      WHERE id=?
-    `).run(challengeRow.id);
-
-    // --------------------------------------------------
-    // 9. Update authenticator counter
-    // --------------------------------------------------
-
-    const newCounter =
-      verification.authenticationInfo?.newCounter ??
-      passkey.counter;
-
-    db.prepare(`
-      UPDATE passkeys
-      SET counter=?
-      WHERE id=?
-    `).run(
-      newCounter,
-      passkey.id
-    );
-
-    // --------------------------------------------------
-    // 10. Approve PC request
-    // --------------------------------------------------
-
-    db.prepare(`
-      UPDATE auth_requests
-      SET
-        phone_device_id=?,
-        status='approved',
-        used_at=?
-      WHERE request_id=?
-    `).run(
-      deviceId,
-      nowIso(),
-      requestId
-    );
-
-    // --------------------------------------------------
-// 10A. Update PC authorization state
+// --------------------------------------------------
+// 8. Finalize authentication atomically
 // --------------------------------------------------
 
 const targetPcId = String(
@@ -730,23 +916,83 @@ const sessionExpiresAt =
 const expiresAt =
   new Date(sessionExpiresAt).toISOString();
 
-db.prepare(`
-  UPDATE pc_devices
-  SET
-    authorized = 1,
-    authorized_device = ?,
-    authorized_at = ?,
-    status = 'online',
-    last_seen = ?,
-    updated_at = ?
-  WHERE pc_device_id = ?
-`).run(
-  deviceId,
-  authorizationTime,
-  authorizationTime,
-  authorizationTime,
-  targetPcId
-);
+const newCounter =
+  verification.authenticationInfo?.newCounter ??
+  passkey.counter;
+
+try {
+
+  finalizeAuthentication({
+    challengeId: challengeRow.id,
+    passkeyId: passkey.id,
+    newCounter,
+    requestId,
+    deviceId,
+    targetPcId,
+    authorizationTime,
+  });
+
+} catch (transactionError) {
+
+  console.error(
+    "❌ Authentication transaction failed:",
+    transactionError.message
+  );
+
+  if (transactionError.message === "DEVICE_TRUST_REVOKED") {
+
+    addSecurityEvent(
+      "UNAUTHORIZED",
+      "CRITICAL",
+      deviceId,
+      `WebAuthn credential verified, but device ${deviceId} is no longer trusted. Authorization denied.`
+    );
+
+    return res.status(403).json({
+      verified: false,
+      authorized: false,
+      error: "Device trust has been revoked",
+    });
+  }
+
+  if (
+    transactionError.message ===
+    "AUTH_CHALLENGE_ALREADY_USED"
+  ) {
+
+    addSecurityEvent(
+      "REPLAY",
+      "WARNING",
+      deviceId,
+      "Authentication challenge was already consumed."
+    );
+
+    return res.status(409).json({
+      verified: false,
+      error: "Authentication challenge already used",
+    });
+  }
+
+  if (
+    transactionError.message ===
+    "AUTH_REQUEST_ALREADY_USED"
+  ) {
+
+    addSecurityEvent(
+      "REPLAY",
+      "WARNING",
+      deviceId,
+      "Authentication request was already approved."
+    );
+
+    return res.status(409).json({
+      verified: false,
+      error: "Authentication request already used",
+    });
+  }
+
+  throw transactionError;
+}
 
 console.log("======================================");
 console.log("🔓 PC AUTHORIZATION STATE UPDATED");
@@ -761,6 +1007,7 @@ console.log(
   AUTH_SESSION_MS / 60000,
   "minutes"
 );
+
 console.log("======================================");
 
 // --------------------------------------------------
@@ -806,60 +1053,6 @@ io.emit("pc:status-updated", {
 
    
     // --------------------------------------------------
-    // 11.5. UPDATE PC AUTHORIZATION STATE
-    // --------------------------------------------------
-
-
-    if (targetPcId) {
-      db.prepare(`
-        INSERT INTO pc_devices (
-          pc_device_id,
-          hostname,
-          platform,
-          status,
-          authorized,
-          authorized_device,
-          authorized_at,
-          last_seen,
-          created_at,
-          updated_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(pc_device_id)
-        DO UPDATE SET
-          status = excluded.status,
-          authorized = excluded.authorized,
-          authorized_device = excluded.authorized_device,
-          authorized_at = excluded.authorized_at,
-          last_seen = excluded.last_seen,
-          updated_at = excluded.updated_at
-      `).run(
-        targetPcId,
-        null,
-        null,
-        "online",
-        1,
-        deviceId,
-        nowIso(),
-        nowIso(),
-        nowIso(),
-        nowIso()
-      );
-
-      console.log("");
-      console.log("======================================");
-      console.log("🟢 PC AUTHORIZATION STATE UPDATED");
-      console.log("======================================");
-      console.log("PC ID   :", targetPcId);
-      console.log("Device  :", deviceId);
-      console.log("Status  : AUTHORIZED");
-      console.log("======================================");
-    }
-
-
-
-
-    // --------------------------------------------------
     // 12. Tell PC to unlock
     // --------------------------------------------------
 
@@ -886,29 +1079,7 @@ if (targetSocketId) {
       "pc:access-granted",
       accessPayload
     );
-    db.prepare(`
-  UPDATE pc_devices
-  SET
-    authorized=1,
-    authorized_device=?,
-    authorized_at=?,
-    status='online',
-    updated_at=?
-  WHERE pc_device_id=?
-`).run(
-  deviceId,
-  nowIso(),
-  nowIso(),
-  targetPcId
-);
-  io.emit("pc:status-updated", {
-  pcDeviceId: targetPcId,
-  authorized: true,
-  authorizedDevice: deviceId,
-  authorizedAt: authorizationTime,
-  expiresAt: new Date(sessionExpiresAt).toISOString(),
-  status: "online"
-});
+    
 addSecurityEvent(
   "ACCESS_GRANTED",
   "INFO",
@@ -1648,7 +1819,7 @@ app.post("/api/devices/:deviceId/revoke", (req, res) => {
       });
     }
 
-    // Only trusted phone devices can be revoked
+    // Only trusted devices can be revoked
     const trustedDevice = db.prepare(`
       SELECT *
       FROM trusted_devices
@@ -1662,56 +1833,184 @@ app.post("/api/devices/:deviceId/revoke", (req, res) => {
       });
     }
 
-    // Revoke trust
+    // -----------------------------------------
+    // 1. Revoke device trust
+    // -----------------------------------------
+
     db.prepare(`
       UPDATE trusted_devices
       SET status = 'revoked'
       WHERE device_id = ?
     `).run(deviceId);
 
-    // Disable registered passkeys for this device
-    db.prepare(`
-      DELETE FROM passkeys
-      WHERE device_id = ?
-    `).run(deviceId);
 
-    // Security audit event
-    addSecurityEvent(
-      "DEVICE_REVOKED",
-      "WARNING",
+    // -----------------------------------------
+    // 2. IMPORTANT:
+    //    DO NOT DELETE PASSKEY
+    // -----------------------------------------
+    //
+    // The passkey remains stored.
+    // Authentication is blocked by trusted_devices.status.
+    //
+    // This allows:
+    // Revoke → Re-Trust → Authenticate
+    //
+    // without registering the passkey again.
+
+
+    // -----------------------------------------
+    // 3. Find PCs currently authorized
+    //    by this device
+    // -----------------------------------------
+
+    const authorizedPCs = db.prepare(`
+      SELECT *
+      FROM pc_devices
+      WHERE authorized = 1
+        AND authorized_device = ?
+    `).all(deviceId);
+
+
+    // -----------------------------------------
+    // 4. Immediately invalidate active sessions
+    // -----------------------------------------
+
+    if (authorizedPCs.length > 0) {
+
+      for (const pc of authorizedPCs) {
+
+        db.prepare(`
+          UPDATE pc_devices
+          SET
+            authorized = 0,
+            authorized_device = NULL,
+            authorized_at = NULL,
+            updated_at = ?
+          WHERE pc_device_id = ?
+        `).run(
+          nowIso(),
+          pc.pc_device_id
+        );
+
+
+        // -------------------------------------
+        // 5. Tell connected PC agent
+        // -------------------------------------
+
+       const targetSocketId = pcAgentSockets.get(pc.pc_device_id);
+
+if (targetSocketId) {
+  const targetSocket = io.sockets.sockets.get(targetSocketId);
+
+  if (targetSocket) {
+    targetSocket.emit("pc:access-revoked", {
+      pcDeviceId: pc.pc_device_id,
+      reason: "DEVICE_REVOKED",
       deviceId,
-      `Trusted device ${deviceId} was revoked.`
-    );
+      timestamp: nowIso()
+    });
 
-    // Notify connected clients
+    console.log(
+      "📡 TARGETED PC REVOKE SENT:",
+      pc.pc_device_id
+    );
+  } else {
+    addSecurityEvent(
+      "PC_OFFLINE",
+      "WARNING",
+      pc.pc_device_id,
+      `PC Agent socket was not available while revoking device ${deviceId}.`
+    );
+  }
+
+} else {
+  addSecurityEvent(
+    "PC_OFFLINE",
+    "WARNING",
+    pc.pc_device_id,
+    `No active PC Agent connection found while revoking device ${deviceId}.`
+  );
+}
+
+
+        // -------------------------------------
+        // 6. Security event
+        // -------------------------------------
+
+        addSecurityEvent(
+          "DEVICE_REVOKED",
+          "CRITICAL",
+          deviceId,
+          `Device ${deviceId} was revoked while PC ${pc.pc_device_id} had an active authorization session. PC access was immediately revoked.`
+        );
+
+
+        console.log("");
+        console.log("======================================");
+        console.log("🔒 ACTIVE PC SESSION REVOKED");
+        console.log("======================================");
+        console.log("PC ID  :", pc.pc_device_id);
+        console.log("Device :", deviceId);
+        console.log("Reason :", "DEVICE_REVOKED");
+        console.log("Action :", "ACCESS REVOKED");
+        console.log("======================================");
+      }
+
+    } else {
+
+      // No active PC session
+      addSecurityEvent(
+        "DEVICE_REVOKED",
+        "WARNING",
+        deviceId,
+        `Trusted device ${deviceId} was revoked. No active PC session was using this device.`
+      );
+
+    }
+
+
+    // -----------------------------------------
+    // 7. Notify dashboard / mobile clients
+    // -----------------------------------------
+
     io.emit("device:revoked", {
       deviceId,
       timestamp: nowIso()
     });
+
 
     console.log("");
     console.log("======================================");
     console.log("🚫 BIOLOCK DEVICE REVOKED");
     console.log("======================================");
     console.log("Device :", deviceId);
-    console.log("Action : TRUST REVOKED");
-    console.log("Passkey: REMOVED");
+    console.log("Action :", "TRUST REVOKED");
+    console.log("Passkey:", "PRESERVED");
+    console.log("Active PCs:", authorizedPCs.length);
     console.log("======================================");
+
 
     return res.json({
       ok: true,
       revoked: true,
       deviceId,
-      message: "Trusted device revoked successfully"
+      activeSessionsRevoked: authorizedPCs.length,
+      passkeyPreserved: true,
+      message:
+        authorizedPCs.length > 0
+          ? "Device revoked and active PC sessions terminated"
+          : "Trusted device revoked successfully"
     });
 
   } catch (e) {
+
     console.error("❌ Device revoke error:", e);
 
     return res.status(500).json({
       ok: false,
       error: e.message
     });
+
   }
 });
 

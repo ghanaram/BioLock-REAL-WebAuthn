@@ -14,7 +14,7 @@ const svc = new Service({
     },
     {
       name: "BIOLOCK_SERVER",
-      value: "https://suit-entity-granny-finally.trycloudflare.com"
+      value: "https://soma-beam-fragrance-wanting.trycloudflare.com"
     }
   ]
 });

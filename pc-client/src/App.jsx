@@ -526,5 +526,266 @@ return <div><div className="flex flex-wrap items-end justify-between gap-4"><div
     </div></div>
 <div className="glass rounded-2xl p-6"><h2 className="text-xl font-semibold">AI Security Insight</h2><div className="mt-5 rounded-xl border border-cyan-300/10 bg-cyan-300/5 p-4"><p className="text-sm text-cyan-100">Prototype Security Insight</p><p className="mt-2 text-sm text-slate-400">{events.filter(e=>['DENIED','RECOVERY_FAILED','UNAUTHORIZED'].includes(e.event_type)).length>=3?'Multiple denied/failed events were detected. This pattern may indicate an unauthorized access attempt.':'No suspicious pattern detected in the current demo logs.'}</p></div><h2 className="mt-8 text-xl font-semibold">Trusted Devices</h2><div className="mt-3 space-y-2">{devices.map(d=><div key={d.device_id} className="rounded-xl bg-white/[.03] p-3"><p className="font-medium">{d.device_name}</p><p className="text-xs text-emerald-300">● {d.trust_status||'Active'}</p></div>)}</div></div></div></div>}
 function Stat({icon,label,value}){return <div className="glass rounded-2xl p-5"><div className="text-cyan-300">{icon}</div><p className="mt-4 text-[11px] tracking-wider text-slate-500">{label}</p><p className="mt-1 text-2xl font-bold">{value}</p></div>}
-function Devices({devices,load}){const remove=async id=>{await fetch(`${API}/api/devices/${id}`,{method:'DELETE'});load()};return <div><p className="text-sm text-cyan-300">TRUST MANAGEMENT</p><h1 className="text-4xl font-bold">Trusted Devices</h1><div className="mt-8 grid gap-4 md:grid-cols-2">
-    {devices.map(d=><div className="glass rounded-2xl p-6" key={d.device_id}><div className="flex items-start justify-between"><div className="flex gap-4"><div className="rounded-xl bg-cyan-300/10 p-3 text-cyan-300">{d.device_type==='phone'?<Smartphone/>:<ShieldCheck/>}</div><div><h2 className="font-semibold">{d.device_name}</h2><p className="mt-1 text-sm text-emerald-300">● Trusted</p></div></div><button onClick={()=>remove(d.device_id)} className="text-xs text-red-300">Remove</button></div><div className="mt-5 grid grid-cols-2 gap-3"><Info label="Owner" value={d.owner_name||'Ghanaram'}/><Info label="Auth" value={d.authentication_method||'Passkey'}/></div></div>)}</div></div>}
+function Devices({ devices, load }) {
+  const [busyDevice, setBusyDevice] = React.useState(null);
+  const [message, setMessage] = React.useState(null);
+
+  const handleAction = async (device, action) => {
+    const deviceId = device.device_id;
+
+    const actionText =
+      action === "revoke"
+        ? "revoke"
+        : "re-trust";
+
+    const confirmed = window.confirm(
+      `${actionText.toUpperCase()} device "${device.device_name}"?`
+    );
+
+    if (!confirmed) return;
+
+    try {
+      setBusyDevice(deviceId);
+      setMessage(null);
+
+      const response = await fetch(
+        `${API}/api/devices/${encodeURIComponent(deviceId)}/${action}`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+        }
+      );
+
+      const data = await response.json();
+
+      if (!response.ok || !data.ok) {
+        throw new Error(
+          data.error || `Failed to ${actionText} device`
+        );
+      }
+
+      setMessage({
+        type: "success",
+        text:
+          action === "revoke"
+            ? `${deviceId} has been revoked.`
+            : `${deviceId} has been re-trusted.`,
+      });
+
+      await load();
+
+    } catch (error) {
+      console.error(
+        `❌ Device ${action} failed:`,
+        error
+      );
+
+      setMessage({
+        type: "error",
+        text: error.message,
+      });
+
+    } finally {
+      setBusyDevice(null);
+    }
+  };
+
+  return (
+    <div>
+      <p className="text-sm text-cyan-300">
+        TRUST MANAGEMENT
+      </p>
+
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h1 className="text-4xl font-bold">
+            Trusted Devices
+          </h1>
+
+          <p className="mt-2 text-sm text-slate-400">
+            Manage smartphones and PCs connected to BioLock.
+          </p>
+        </div>
+
+        <button
+          onClick={load}
+          className="rounded-xl border border-white/10 px-4 py-2 text-sm hover:bg-white/5"
+        >
+          <RefreshCw
+            className="mr-2 inline"
+            size={15}
+          />
+          Refresh
+        </button>
+      </div>
+
+      {message && (
+        <div
+          className={`mt-5 rounded-xl border p-4 text-sm ${
+            message.type === "success"
+              ? "border-emerald-300/20 bg-emerald-400/10 text-emerald-300"
+              : "border-red-300/20 bg-red-400/10 text-red-300"
+          }`}
+        >
+          {message.type === "success"
+            ? "✓ "
+            : "⚠ "}
+          {message.text}
+        </div>
+      )}
+
+      <div className="mt-8 grid gap-4 md:grid-cols-2">
+        {devices.map((d) => {
+          const isTrusted =
+            d.trust_status === "trusted";
+
+          const isBusy =
+            busyDevice === d.device_id;
+
+          return (
+            <motion.div
+              key={d.device_id}
+              initial={{
+                opacity: 0,
+                y: 10,
+              }}
+              animate={{
+                opacity: 1,
+                y: 0,
+              }}
+              className="glass rounded-2xl p-6"
+            >
+              <div className="flex items-start justify-between gap-4">
+                <div className="flex gap-4">
+                  <div className="rounded-xl bg-cyan-300/10 p-3 text-cyan-300">
+                    {d.device_type === "phone" ? (
+                      <Smartphone />
+                    ) : (
+                      <ShieldCheck />
+                    )}
+                  </div>
+
+                  <div>
+                    <h2 className="font-semibold">
+                      {d.device_name}
+                    </h2>
+
+                    <p className="mt-1 text-xs text-slate-500">
+                      {d.device_id}
+                    </p>
+
+                    <p
+                      className={`mt-2 text-sm ${
+                        isTrusted
+                          ? "text-emerald-300"
+                          : "text-red-300"
+                      }`}
+                    >
+                      ●{" "}
+                      {isTrusted
+                        ? "Trusted"
+                        : "Revoked"}
+                    </p>
+                  </div>
+                </div>
+
+                <span
+                  className={`rounded-full px-3 py-1 text-[10px] ${
+                    d.status === "active"
+                      ? "bg-emerald-400/10 text-emerald-300"
+                      : "bg-red-400/10 text-red-300"
+                  }`}
+                >
+                  {d.status?.toUpperCase() || "ACTIVE"}
+                </span>
+              </div>
+
+              <div className="mt-5 grid grid-cols-2 gap-3">
+                <Info
+                  label="Owner"
+                  value={
+                    d.owner_name ||
+                    "Ghanaram"
+                  }
+                />
+
+                <Info
+                  label="Authentication"
+                  value={
+                    d.authentication_method ||
+                    "Passkey"
+                  }
+                />
+
+                <Info
+                  label="Device Type"
+                  value={
+                    d.device_type?.toUpperCase() ||
+                    "DEVICE"
+                  }
+                />
+
+                <Info
+                  label="Last Seen"
+                  value={
+                    d.last_seen
+                      ? fmt(d.last_seen)
+                      : "--"
+                  }
+                />
+              </div>
+
+              <div className="mt-5 flex gap-3">
+                {isTrusted ? (
+                  <button
+                    onClick={() =>
+                      handleAction(
+                        d,
+                        "revoke"
+                      )
+                    }
+                    disabled={isBusy}
+                    className="flex-1 rounded-xl border border-red-300/20 bg-red-400/10 px-4 py-3 text-sm text-red-300 hover:bg-red-400/20 disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    {isBusy
+                      ? "Revoking..."
+                      : "Revoke Device"}
+                  </button>
+                ) : (
+                  <button
+                    onClick={() =>
+                      handleAction(
+                        d,
+                        "retrust"
+                      )
+                    }
+                    disabled={isBusy}
+                    className="flex-1 rounded-xl border border-emerald-300/20 bg-emerald-400/10 px-4 py-3 text-sm text-emerald-300 hover:bg-emerald-400/20 disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    {isBusy
+                      ? "Re-trusting..."
+                      : "Re-Trust Device"}
+                  </button>
+                )}
+              </div>
+
+              <div className="mt-3 text-[10px] text-slate-500">
+                {isTrusted
+                  ? "Device can request WebAuthn authorization."
+                  : "Authentication is blocked until trust is restored."}
+              </div>
+            </motion.div>
+          );
+        })}
+
+        {devices.length === 0 && (
+          <div className="glass rounded-2xl p-8 text-center text-slate-500 md:col-span-2">
+            No BioLock devices registered.
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

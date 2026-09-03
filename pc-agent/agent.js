@@ -7,7 +7,7 @@ const AGENT_PORT = 47821;
 
 const API =
   process.env.BIOLOCK_SERVER ||
-  "https://suit-entity-granny-finally.trycloudflare.com";
+  "https://soma-beam-fragrance-wanting.trycloudflare.com";
 
 const PC_ID =
   process.env.BIOLOCK_PC_ID ||
@@ -379,6 +379,8 @@ function lockWindows() {
    console.log("PC ID :", PC_ID);
    console.log("Reason:", data?.reason || "User locked PC");
    console.log("State : LOCKED");
+    console.log("🚨 DEVICE REVOKE EVENT RECEIVED BY PC AGENT");
+  console.log("Event Data:", data);
    console.log("=================================");
   lockWindows();
 
