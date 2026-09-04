@@ -9,6 +9,7 @@ const rateLimit = require("express-rate-limit");
 const { Server } = require("socket.io");
 const QRCode = require("qrcode");
 const crypto = require("crypto");
+const cookieParser = require("cookie-parser");
 const { v4: uuidv4 } = require("uuid");
 // const {
 //   generateRegistrationOptions,
@@ -38,10 +39,58 @@ cert: fs.readFileSync(
   },
   app
 );
+
+const ADMIN_USERNAME = process.env.ADMIN_USERNAME || "admin";
+const ADMIN_PASSWORD_HASH = process.env.ADMIN_PASSWORD_HASH;
+
+const ADMIN_SESSION_TTL = 8 * 60 * 60 * 1000; // 8 hours
+
+const adminSessions = new Map();
+
+function createAdminSession() {
+  const token = crypto.randomBytes(32).toString("hex");
+
+  adminSessions.set(token, {
+    createdAt: Date.now(),
+    expiresAt: Date.now() + ADMIN_SESSION_TTL,
+  });
+
+  return token;
+}
+
+function isValidAdminSession(token) {
+  if (!token) return false;
+
+  const session = adminSessions.get(token);
+
+  if (!session) return false;
+
+  if (Date.now() > session.expiresAt) {
+    adminSessions.delete(token);
+    return false;
+  }
+
+  return true;
+}
+
+function requireAdmin(req, res, next) {
+  const token = req.cookies?.biolock_admin;
+    console.log("🛡️ ADMIN AUTH CHECK");
+  console.log("Cookie received:", !!token);
+  if (!isValidAdminSession(token)) {
+    return res.status(401).json({
+      ok: false,
+      error: "Admin authentication required",
+    });
+  }
+
+  next();
+}
+
 const PORT = Number(process.env.PORT || 5000);
 const RP_NAME = process.env.RP_NAME || "BioLock";
 const RP_ID = process.env.RP_ID || "localhost";
-const ORIGIN = process.env.ORIGIN || "https://soma-beam-fragrance-wanting.trycloudflare.com";
+const ORIGIN = process.env.ORIGIN || "https://antenna-dangerous-between-finite.trycloudflare.com";
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || ORIGIN;
 const MOBILE_PATH = process.env.MOBILE_PATH || "/mobile/";
 const AUTH_SESSION_MS = Number(process.env.AUTH_SESSION_MINUTES || 30) * 60 * 1000;
@@ -54,6 +103,7 @@ app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(cors({ origin: true, credentials: true }));
 app.use(express.json({ limit: "100kb" }));
 app.use(rateLimit({ windowMs: 60_000, limit: 120, standardHeaders: true }));
+app.use(cookieParser());
 
 const io = new Server(server, {
   cors: { origin: true, methods: ["GET", "POST", "DELETE"] }
@@ -95,6 +145,133 @@ if (typeof io !== "undefined") {
 
   console.log("📡 LIVE SECURITY EVENT:", event);
 }
+
+app.post("/api/admin/login", (req, res) => {
+  try {
+    const { username, password } = req.body || {};
+
+    if (!username || !password) {
+      return res.status(400).json({
+        ok: false,
+        error: "Username and password are required",
+      });
+    }
+
+    if (!ADMIN_PASSWORD_HASH) {
+      return res.status(500).json({
+        ok: false,
+        error: "Admin authentication is not configured",
+      });
+    }
+
+    if (username !== ADMIN_USERNAME) {
+      return res.status(401).json({
+        ok: false,
+        error: "Invalid admin credentials",
+      });
+    }
+
+    const parts = ADMIN_PASSWORD_HASH.split(":");
+
+    if (parts.length !== 3 || parts[0] !== "scrypt") {
+      return res.status(500).json({
+        ok: false,
+        error: "Invalid admin password configuration",
+      });
+    }
+
+    const [, salt, storedHash] = parts;
+
+    crypto.scrypt(
+      password,
+      salt,
+      64,
+      (err, derivedKey) => {
+        if (err) {
+          console.error(err);
+
+          return res.status(500).json({
+            ok: false,
+            error: "Authentication failed",
+          });
+        }
+
+        const derivedHash =
+          derivedKey.toString("hex");
+
+        const valid =
+          derivedHash.length === storedHash.length &&
+          crypto.timingSafeEqual(
+            Buffer.from(derivedHash),
+            Buffer.from(storedHash)
+          );
+
+        if (!valid) {
+          return res.status(401).json({
+            ok: false,
+            error: "Invalid admin credentials",
+          });
+        }
+
+        const token = createAdminSession();
+
+        res.cookie(
+          "biolock_admin",
+          token,
+          {
+            httpOnly: true,
+            sameSite: "lax",
+            secure: false, // Set to true in production with HTTPS
+            maxAge: ADMIN_SESSION_TTL,
+            path: "/",
+          }
+        );
+
+        return res.json({
+          ok: true,
+          authenticated: true,
+        });
+      }
+    );
+
+  } catch (error) {
+    console.error("❌ Admin login error:", error);
+
+    return res.status(500).json({
+      ok: false,
+      error: "Admin login failed",
+    });
+  }
+});
+
+app.post("/api/admin/logout", (req, res) => {
+  const token = req.cookies?.biolock_admin;
+
+  if (token) {
+    adminSessions.delete(token);
+  }
+
+ res.clearCookie("biolock_admin", {
+  httpOnly: true,
+  sameSite: "lax",
+  secure: false, // Set to true in production with HTTPS
+  path: "/",
+});
+
+  return res.json({
+    ok: true,
+    authenticated: false,
+  });
+});
+
+app.get("/api/admin/session", (req, res) => {
+  const token = req.cookies?.biolock_admin;
+
+  return res.json({
+    ok: true,
+    authenticated: isValidAdminSession(token),
+  });
+});
 
 const finalizeAuthentication = db.transaction(({
   challengeId,
@@ -1394,7 +1571,7 @@ io.emit("pc:status-updated", {
   }
 });
 
-app.post("/api/devices/pair", (req,res) => {
+app.post("/api/devices/pair", requireAdmin, (req,res) => {
   const phoneDeviceId = String(req.body.phoneDeviceId || "GHANARAM-PHONE");
   ensureDevice(phoneDeviceId,"phone","Ghanaram's Phone");
   db.prepare(`INSERT OR REPLACE INTO trusted_devices
@@ -1405,12 +1582,43 @@ app.post("/api/devices/pair", (req,res) => {
   res.json({ok:true});
 });
 
-app.get("/api/devices", (_,res) => {
-  const devices = db.prepare(`
-    SELECT d.*, t.owner_name, t.authentication_method, t.status AS trust_status
-    FROM devices d LEFT JOIN trusted_devices t ON d.device_id=t.device_id
-    ORDER BY d.created_at DESC`).all();
-  res.json(devices);
+app.get("/api/devices", requireAdmin, (_, res) => {
+  try {
+    const devices = db.prepare(`
+      SELECT
+        d.*,
+        t.owner_name,
+        t.authentication_method,
+        t.status AS trust_status,
+
+        p.hostname AS pc_hostname,
+        p.platform AS pc_platform,
+        p.authorized AS pc_authorized,
+        p.authorized_device AS pc_authorized_device,
+        p.authorized_at AS pc_authorized_at,
+        p.last_seen AS pc_last_seen
+
+      FROM devices d
+
+      LEFT JOIN trusted_devices t
+        ON d.device_id = t.device_id
+
+      LEFT JOIN pc_devices p
+        ON d.device_id = p.pc_device_id
+
+      ORDER BY d.created_at DESC
+    `).all();
+
+    res.json(devices);
+
+  } catch (error) {
+    console.error("❌ Failed to load devices:", error);
+
+    res.status(500).json({
+      ok: false,
+      error: "Failed to load devices"
+    });
+  }
 });
 
 // ==========================================
@@ -1542,7 +1750,7 @@ app.get("/api/devices/:deviceId", (req, res) => {
 // RE-TRUST DEVICE
 // ==================================================
 
-app.post("/api/devices/:deviceId/retrust", (req, res) => {
+app.post("/api/devices/:deviceId/retrust", requireAdmin, (req, res) => {
   try {
     const deviceId = String(req.params.deviceId || "").trim();
 
@@ -1795,7 +2003,7 @@ app.post("/api/pcs/:pcDeviceId/lock", (req, res) => {
 // REVOKE TRUSTED DEVICE
 // ==========================================
 
-app.post("/api/devices/:deviceId/revoke", (req, res) => {
+app.post("/api/devices/:deviceId/revoke", requireAdmin, (req, res) => {
   try {
     const deviceId = String(req.params.deviceId || "").trim();
 
@@ -2027,9 +2235,40 @@ app.get("/api/events", (_,res) => {
   res.json(rows);
 });
 
-app.get("/api/security-events", (_,res) => {
-  const rows = db.prepare("SELECT * FROM security_events ORDER BY id DESC LIMIT 50").all();
-  res.json(rows);
+app.get("/api/security-events", (req, res) => {
+  try {
+    const limit = Math.min(
+      Math.max(Number(req.query.limit) || 50, 1),
+      100
+    );
+
+    const rows = db.prepare(`
+      SELECT
+        id,
+        event_type,
+        severity,
+        device_id,
+        message,
+        created_at
+      FROM security_events
+      ORDER BY id DESC
+      LIMIT ?
+    `).all(limit);
+
+    return res.json({
+      ok: true,
+      count: rows.length,
+      events: rows
+    });
+
+  } catch (e) {
+    console.error("❌ Security events error:", e);
+
+    return res.status(500).json({
+      ok: false,
+      error: "Failed to load security events"
+    });
+  }
 });
 
 app.post("/api/recovery", (req,res) => {
@@ -2446,7 +2685,7 @@ if (currentPcState) {
 
 });
 
-app.delete("/api/webauthn/passkey/reset", (req, res) => {
+app.delete("/api/webauthn/passkey/reset",  (req, res) => {
   try {
     const deviceId = String(
       req.query.deviceId || "GHANARAM-PHONE"

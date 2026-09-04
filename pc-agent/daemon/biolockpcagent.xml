@@ -22,7 +22,7 @@
 	<logmode>rotate</logmode>
 	<stoptimeout>30sec</stoptimeout>
 	<env name="BIOLOCK_PC_ID" value="BIOLOCK-PC-01"/>
-	<env name="BIOLOCK_SERVER" value="https://soma-beam-fragrance-wanting.trycloudflare.com"/>
+	<env name="BIOLOCK_SERVER" value="https://antenna-dangerous-between-finite.trycloudflare.com"/>
 	<serviceaccount>
 		<domain>GHANARAM</domain>
 		<user>LocalSystem</user>

@@ -7,7 +7,7 @@ const AGENT_PORT = 47821;
 
 const API =
   process.env.BIOLOCK_SERVER ||
-  "https://soma-beam-fragrance-wanting.trycloudflare.com";
+  "https://antenna-dangerous-between-finite.trycloudflare.com";
 
 const PC_ID =
   process.env.BIOLOCK_PC_ID ||
