@@ -201,7 +201,9 @@ const load = async () => {
       return;
     }
 
-    setDevices(await devicesResponse.json());
+    const devicesData = await devicesResponse.json();
+console.log("📡 DEVICES API AFTER AUTH:", devicesData);
+setDevices(devicesData);
 
   } catch (error) {
     console.error("❌ Admin protected API error:", error);
@@ -247,14 +249,29 @@ useEffect(() => {
     try {
       const r = await fetch(AGENT_STATUS_URL);
       const d = await r.json();
-
       console.log("🤖 PC AGENT STATUS:", d);
-
       setAgentStatus((prev) => ({
         ...d,
         expiresAt: d.expiresAt ?? prev?.expiresAt ?? null,
       }));
-
+      setDevices((prev) =>
+  prev.map((pc) =>
+    pc.device_id === d.pcId ||
+    pc.device_id === "BIOLOCK-PC-01"
+      ? {
+          ...pc,
+          status:
+            d.agentRunning && d.socketConnected
+              ? "active"
+              : "offline",
+          pc_authorized: d.pcAuthorized ? 1 : 0,
+          pc_authorized_device: d.authorizedDevice ?? null,
+          pc_authorized_at: d.authorizationTime ?? null,
+          pc_last_seen: new Date().toISOString(),
+        }
+      : pc
+  )
+);
       if (d.pcAuthorized) {
         setLocked(false);
         setStatus("BIOLOCK UNLOCKED");
@@ -306,20 +323,24 @@ useEffect(() => {
   socket.on("pc:status-updated", (data) => {
     console.log("🔄 PC STATUS UPDATED:", data);
 
-    setDevices((prev) =>
-      prev.map((pc) =>
-        pc.pc_device_id === data.pcDeviceId
-          ? {
-              ...pc,
-              authorized: data.authorized ? 1 : 0,
-              authorized_device: data.authorizedDevice,
-              authorized_at: data.authorizedAt,
-              expiresAt: data.expiresAt,
-              status: data.status,
-            }
-          : pc
-      )
-    );
+  setDevices((prev) =>
+  prev.map((pc) =>
+    pc.device_id === data.pcDeviceId
+      ? {
+          ...pc,
+          pc_authorized: data.authorized ? 1 : 0,
+          pc_authorized_device: data.authorizedDevice ?? null,
+          pc_authorized_at: data.authorizedAt ?? null,
+          pc_last_seen: data.lastSeen ?? pc.pc_last_seen,
+          status:
+            data.status === "CONNECTED" ||
+            data.status === "connected"
+              ? "active"
+              : data.status ?? pc.status,
+        }
+      : pc
+  )
+);
 
     setAgentStatus((prev) => {
       const authorized = data.authorized === true;
@@ -911,8 +932,8 @@ function Devices({ devices, load }) {
           ? "bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,0.7)]"
           : "bg-red-400 shadow-[0_0_10px_rgba(248,113,113,0.7)]"
         : d.status === "active"
-          ? "bg-cyan-400 shadow-[0_0_10px_rgba(34,211,238,0.7)]"
-          : "bg-slate-500"
+          ? "bg-cyan-400 shadow-[0_0_10px_rgba(6,182,212,0.7)]"
+          : "bg-slate-400 shadow-[0_0_10px_rgba(148,163,184,0.7)]"
     }`}
   />
 
